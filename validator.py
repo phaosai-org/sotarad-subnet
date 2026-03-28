@@ -81,16 +81,46 @@ ties are broken by lower UID.
 
 Dataset API contract (configurable base URL)
 --------------------------------------------
-    GET {DATASET_BASE_URL}/samples
-        ?after=<unix_float>&before=<unix_float>&limit=<int>
-    → {
-        "samples": [
-            {"id": str, "image_url": str, "label": 0|1, "timestamp": float},
-            ...
-        ]
-      }
+    GET {DATASET_BASE_URL}/studies
+        ?after=<YYYY-MM-DD>&before=<YYYY-MM-DD>&limit=<int>
 
-Reference baseline model: abersoz/Qwen2-VL-2B-Instruct-bnb-4bit-Radiology-mini
+    Response schema (matches data/results.json):
+    {
+        "api_version": "1.0",
+        "cohort_id": str,
+        "exported_at": str,        # ISO-8601 datetime
+        "studies": [
+            {
+                "study_id":          str,          # e.g. "ms-00001"
+                "image_file":        str,          # filename OR full URL
+                "acquisition_date":  str,          # "YYYY-MM-DD"
+                "report_findings": {
+                    "positive_findings": [
+                        {
+                            "condition": str,   # e.g. "Tuberculosis", "Silicosis"
+                            "status":    str,   # "active" | "previous" | "chronic" ...
+                            ...
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+Label derivation:
+    label = 1 (screen positive) if ANY positive_finding has:
+        condition ∈ TARGET_CONDITIONS  AND  status == "active"
+    label = 0 otherwise.
+
+    Default TARGET_CONDITIONS: Tuberculosis, Silicosis
+    Override via env var TARGET_CONDITIONS=Tuberculosis,Silicosis,...
+
+Image URL construction:
+    If image_file is already a full URL (starts with http) → used as-is.
+    Otherwise → IMAGE_BASE_URL + "/" + image_file.
+    Set IMAGE_BASE_URL to the dataset server's image-serving endpoint.
+
+Reference baseline model: mervinpraison/Llama-3.2-11B-Vision-Radiology-mini
 """
 
 from __future__ import annotations
@@ -104,7 +134,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
@@ -121,6 +151,22 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# ── Target condition config ───────────────────────────────────────────────────
+# Conditions (as they appear in report_findings[].condition) that count as a
+# "screen positive" when their status is "active".  Comma-separated env var.
+_DEFAULT_TARGET_CONDITIONS = {"Tuberculosis", "Silicosis"}
+
+def _parse_target_conditions(raw: str) -> frozenset[str]:
+    """Parse TARGET_CONDITIONS env var into a frozenset of condition names."""
+    if not raw.strip():
+        return frozenset(_DEFAULT_TARGET_CONDITIONS)
+    return frozenset(c.strip() for c in raw.split(",") if c.strip())
+
+TARGET_CONDITIONS: frozenset[str] = _parse_target_conditions(
+    os.getenv("TARGET_CONDITIONS", "")
+)
 
 
 # ── Tier configuration ────────────────────────────────────────────────────────
@@ -426,27 +472,74 @@ def filter_eligible(
 
 # ── Dataset client ────────────────────────────────────────────────────────────
 
+def _acquisition_date_to_ts(date_str: str) -> float:
+    """Convert "YYYY-MM-DD" acquisition date to a UTC unix timestamp (start of day)."""
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _is_screen_positive(
+    positive_findings: list[dict],
+    target_conditions: frozenset[str],
+) -> int:
+    """
+    Return 1 if any finding matches a target condition with status "active",
+    else 0.  Case-sensitive on condition name; status comparison is exact.
+    """
+    for finding in positive_findings:
+        if (
+            finding.get("condition") in target_conditions
+            and finding.get("status") == "active"
+        ):
+            return 1
+    return 0
+
+
+def _resolve_image_url(image_field: str, image_base_url: str) -> str:
+    """
+    Return a usable image URL.
+    If image_field is already a full URL, return it as-is.
+    Otherwise join image_base_url + "/" + image_field.
+    """
+    if image_field.startswith("http://") or image_field.startswith("https://"):
+        return image_field
+    base = image_base_url.rstrip("/")
+    return f"{base}/{image_field}"
+
+
 async def fetch_eval_samples(
     session: aiohttp.ClientSession,
     dataset_base_url: str,
     dataset_api_key: str,
+    image_base_url: str,
+    target_conditions: frozenset[str],
     after_ts: float,
     before_ts: float,
     limit: int = 100,
 ) -> list[EvalSample]:
     """
-    Fetch labelled evaluation samples from the configured public dataset API.
+    Fetch labelled evaluation studies from the configured public dataset API.
 
     API contract:
-        GET {dataset_base_url}/samples?after=<ts>&before=<ts>&limit=<n>
-        → {"samples": [{"id": str, "image_url": str, "label": 0|1, "timestamp": float}]}
+        GET {dataset_base_url}/studies?after=<YYYY-MM-DD>&before=<YYYY-MM-DD>&limit=<n>
+        → { "studies": [ { "study_id", "image_file", "acquisition_date",
+                            "report_findings": { "positive_findings": [...] } } ] }
+
+    Label is derived from positive_findings: 1 if any finding has
+    condition ∈ target_conditions AND status == "active", else 0.
     """
     if not dataset_base_url:
         logger.warning("DATASET_BASE_URL not configured – skipping evaluation")
         return []
 
-    url     = f"{dataset_base_url.rstrip('/')}/samples"
-    params  = {"after": after_ts, "before": before_ts, "limit": limit}
+    # Convert unix timestamps to ISO date strings for the API query
+    after_date  = datetime.utcfromtimestamp(after_ts).strftime("%Y-%m-%d")
+    before_date = datetime.utcfromtimestamp(before_ts).strftime("%Y-%m-%d")
+
+    url     = f"{dataset_base_url.rstrip('/')}/studies"
+    params  = {"after": after_date, "before": before_date, "limit": limit}
     headers = {}
     if dataset_api_key:
         headers["Authorization"] = f"Bearer {dataset_api_key}"
@@ -463,17 +556,32 @@ async def fetch_eval_samples(
         return []
 
     samples: list[EvalSample] = []
-    for s in data.get("samples", []):
+    for study in data.get("studies", []):
         try:
+            study_id         = str(study["study_id"])
+            image_field      = str(study.get("image_url") or study["image_file"])
+            acq_date         = str(study["acquisition_date"])
+            positive_findings = study.get("report_findings", {}).get("positive_findings", [])
+
+            image_url = _resolve_image_url(image_field, image_base_url)
+            label     = _is_screen_positive(positive_findings, target_conditions)
+            timestamp = _acquisition_date_to_ts(acq_date)
+
             samples.append(EvalSample(
-                sample_id=str(s["id"]),
-                image_url=str(s["image_url"]),
-                label=int(s["label"]),
-                timestamp=float(s["timestamp"]),
+                sample_id=study_id,
+                image_url=image_url,
+                label=label,
+                timestamp=timestamp,
             ))
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.debug(f"Skipping malformed study entry: {exc}")
             continue
 
+    pos = sum(s.label for s in samples)
+    logger.info(
+        f"Dataset: {len(samples)} studies parsed | "
+        f"{pos} positive / {len(samples) - pos} negative"
+    )
     return samples
 
 
@@ -482,9 +590,13 @@ async def fetch_eval_samples(
 _INFERENCE_PROMPT: str = os.getenv(
     "INFERENCE_PROMPT",
     (
-        "You are a radiology pre-screening AI. Analyze this chest X-ray for signs "
-        "of active tuberculosis. Reply with exactly one word: positive (if TB signs "
-        "are present) or negative (if no TB signs are present)."
+        "You are a chest X-ray pre-screening AI. Examine this radiograph and determine "
+        "whether it shows signs of active tuberculosis (TB) or active silicosis requiring "
+        "clinical attention.\n\n"
+        "Reply with exactly one word:\n"
+        "positive — if active TB or active silicosis is present\n"
+        "negative — if neither condition is active\n\n"
+        "Answer:"
     ),
 )
 
@@ -626,6 +738,8 @@ async def run_daily_evaluation(
     db_path: str,
     dataset_base_url: str,
     dataset_api_key: str,
+    image_base_url: str,
+    target_conditions: frozenset[str],
     chutes_llm_url: str,
     chutes_api_key: str,
     chutes_timeout: int,
@@ -664,6 +778,8 @@ async def run_daily_evaluation(
     async with aiohttp.ClientSession() as session:
         samples = await fetch_eval_samples(
             session, dataset_base_url, dataset_api_key,
+            image_base_url=image_base_url,
+            target_conditions=target_conditions,
             after_ts=eval_start_ts,
             before_ts=eval_end_ts,
             limit=eval_samples_per_day,
@@ -853,6 +969,8 @@ async def validator_loop(
     db_path: str,
     dataset_base_url: str,
     dataset_api_key: str,
+    image_base_url: str,
+    target_conditions: frozenset[str],
     chutes_llm_url: str,
     chutes_api_key: str,
     chutes_timeout: int,
@@ -926,6 +1044,8 @@ async def validator_loop(
                         db_path=db_path,
                         dataset_base_url=dataset_base_url,
                         dataset_api_key=dataset_api_key,
+                        image_base_url=image_base_url,
+                        target_conditions=target_conditions,
                         chutes_llm_url=chutes_llm_url,
                         chutes_api_key=chutes_api_key,
                         chutes_timeout=chutes_timeout,
@@ -991,9 +1111,13 @@ async def validator_loop(
 @click.option("--db-path",              default=lambda: os.getenv("DB_PATH", "validator_scores.db"),
               help="SQLite file for daily evaluation scores")
 @click.option("--dataset-base-url",     default=lambda: os.getenv("DATASET_BASE_URL", ""),
-              help="Public dataset API base URL")
+              help="Public dataset API base URL (studies endpoint)")
 @click.option("--dataset-api-key",      default=lambda: os.getenv("DATASET_API_KEY", ""),
               help="Bearer token for dataset API (if required)")
+@click.option("--image-base-url",       default=lambda: os.getenv("IMAGE_BASE_URL", ""),
+              help="Base URL prepended to image_file filenames (e.g. https://data.sotarad.ai/images)")
+@click.option("--target-conditions",    default=lambda: os.getenv("TARGET_CONDITIONS", ""),
+              help="Comma-separated conditions that count as screen-positive (default: Tuberculosis,Silicosis)")
 @click.option("--chutes-api-key",       default=lambda: os.getenv("CHUTES_API_KEY", ""),
               help="Chutes API key (cpk_...)")
 @click.option("--chutes-llm-url",       default=lambda: os.getenv("CHUTES_LLM_URL", "https://llm.chutes.ai/v1"),
@@ -1019,6 +1143,8 @@ def main(
     db_path: str,
     dataset_base_url: str,
     dataset_api_key: str,
+    image_base_url: str,
+    target_conditions: str,
     chutes_api_key: str,
     chutes_llm_url: str,
     chutes_timeout: int,
@@ -1030,9 +1156,11 @@ def main(
 ) -> None:
     """SotaRad subnet validator: scores radiology pre-screening models via Fβ."""
     logging.getLogger().setLevel(getattr(logging, log_level.upper()))
+    parsed_conditions = _parse_target_conditions(target_conditions)
     logger.info(
         f"Starting SotaRad validator | network={network} netuid={netuid} "
-        f"β={fbeta_beta} eval_delay={eval_delay_days}d samples/day={eval_samples_per_day}"
+        f"β={fbeta_beta} eval_delay={eval_delay_days}d samples/day={eval_samples_per_day} "
+        f"target_conditions={sorted(parsed_conditions)}"
     )
     asyncio.run(validator_loop(
         network=network,
@@ -1042,6 +1170,8 @@ def main(
         db_path=db_path,
         dataset_base_url=dataset_base_url,
         dataset_api_key=dataset_api_key,
+        image_base_url=image_base_url,
+        target_conditions=parsed_conditions,
         chutes_llm_url=chutes_llm_url,
         chutes_api_key=chutes_api_key,
         chutes_timeout=chutes_timeout,

@@ -1,0 +1,392 @@
+{
+  "api_version": "1.0",
+  "cohort_id": "cohort-cxr-2026-03-001",
+  "exported_at": "2026-03-27T09:14:00Z",
+  "total_studies": 10,
+  "modality": "CR",
+  "anatomy": "CHEST",
+  "studies": [
+    {
+      "study_id": "ms-00001",
+      "image_file": "1.png",
+      "acquisition_date": "2023-08-14",
+      "patient_demographics": {
+        "age_at_acquisition": 47,
+        "sex": "M"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2023-08-14",
+        "radiologist_conclusion": "Active pulmonary tuberculosis with upper lobe cavitation.",
+        "positive_findings": [
+          {
+            "condition": "Tuberculosis",
+            "status": "active",
+            "icd10": "A15.0",
+            "snomed_ct": "154283005",
+            "laterality": "bilateral",
+            "location": "upper lobes",
+            "descriptors": ["cavitation", "consolidation", "nodules"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    },
+    {
+      "study_id": "ms-00002",
+      "image_file": "2.png",
+      "acquisition_date": "2022-11-03",
+      "patient_demographics": {
+        "age_at_acquisition": 63,
+        "sex": "M"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2022-11-03",
+        "radiologist_conclusion": "Fibrocalcific changes consistent with previous tuberculosis. No active disease.",
+        "positive_findings": [
+          {
+            "condition": "Tuberculosis",
+            "status": "previous",
+            "icd10": "B90.9",
+            "snomed_ct": "415068001",
+            "laterality": "bilateral",
+            "location": "upper lobes",
+            "descriptors": ["fibrocalcific changes", "calcified nodules", "pleural thickening"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    },
+    {
+      "study_id": "ms-00003",
+      "image_file": "3.png",
+      "acquisition_date": "2024-01-22",
+      "patient_demographics": {
+        "age_at_acquisition": 55,
+        "sex": "M"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2024-01-22",
+        "radiologist_conclusion": "Bilateral upper lobe micronodules and progressive massive fibrosis in keeping with complicated silicosis.",
+        "positive_findings": [
+          {
+            "condition": "Silicosis",
+            "status": "active",
+            "icd10": "J62.8",
+            "snomed_ct": "805002",
+            "laterality": "bilateral",
+            "location": "upper lobes",
+            "descriptors": ["micronodules", "progressive massive fibrosis", "eggshell calcification"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    },
+    {
+      "study_id": "ms-00004",
+      "image_file": "4.png",
+      "acquisition_date": "2023-05-10",
+      "patient_demographics": {
+        "age_at_acquisition": 34,
+        "sex": "F"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2023-05-10",
+        "radiologist_conclusion": "Right lower lobe consolidation consistent with community-acquired pneumonia.",
+        "positive_findings": [
+          {
+            "condition": "Pneumonia",
+            "status": "active",
+            "icd10": "J18.9",
+            "snomed_ct": "233604007",
+            "laterality": "right",
+            "location": "lower lobe",
+            "descriptors": ["consolidation", "air bronchograms"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    },
+    {
+      "study_id": "ms-00005",
+      "image_file": "5.png",
+      "acquisition_date": "2024-02-18",
+      "patient_demographics": {
+        "age_at_acquisition": 71,
+        "sex": "M"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2024-02-18",
+        "radiologist_conclusion": "Active tuberculosis with miliary pattern. Incidental hyperinflation suggesting underlying emphysema.",
+        "positive_findings": [
+          {
+            "condition": "Tuberculosis",
+            "status": "active",
+            "icd10": "A19.9",
+            "snomed_ct": "56717001",
+            "laterality": "bilateral",
+            "location": "diffuse",
+            "descriptors": ["miliary pattern", "micronodules"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": [
+          {
+            "condition": "Emphysema",
+            "status": "chronic",
+            "icd10": "J43.9",
+            "snomed_ct": "49158009",
+            "descriptors": ["hyperinflation", "flattened diaphragms"],
+            "certainty": "probable",
+            "source": "hl7_report_nlp"
+          }
+        ]
+      }
+    },
+    {
+      "study_id": "ms-00006",
+      "image_file": "6.png",
+      "acquisition_date": "2022-07-30",
+      "patient_demographics": {
+        "age_at_acquisition": 58,
+        "sex": "M"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2022-07-30",
+        "radiologist_conclusion": "Simple silicosis with bilateral upper zone nodularity. Background of previous TB with residual calcified hilar nodes.",
+        "positive_findings": [
+          {
+            "condition": "Silicosis",
+            "status": "active",
+            "icd10": "J62.8",
+            "snomed_ct": "805002",
+            "laterality": "bilateral",
+            "location": "upper zones",
+            "descriptors": ["nodularity", "simple silicosis pattern"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          },
+          {
+            "condition": "Tuberculosis",
+            "status": "previous",
+            "icd10": "B90.9",
+            "snomed_ct": "415068001",
+            "laterality": "bilateral",
+            "location": "hilar",
+            "descriptors": ["calcified hilar lymph nodes"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    },
+    {
+      "study_id": "ms-00007",
+      "image_file": "7.png",
+      "acquisition_date": "2023-09-05",
+      "patient_demographics": {
+        "age_at_acquisition": 29,
+        "sex": "F"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2023-09-05",
+        "radiologist_conclusion": "Bilateral interstitial infiltrates. Clinical correlation with COVID-19 PCR recommended. Pattern consistent with viral pneumonitis.",
+        "positive_findings": [
+          {
+            "condition": "Viral Pneumonitis",
+            "status": "active",
+            "icd10": "J12.9",
+            "snomed_ct": "75570004",
+            "laterality": "bilateral",
+            "location": "perihilar and lower zones",
+            "descriptors": ["ground-glass opacities", "interstitial infiltrates"],
+            "certainty": "probable",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    },
+    {
+      "study_id": "ms-00008",
+      "image_file": "8.png",
+      "acquisition_date": "2023-12-11",
+      "patient_demographics": {
+        "age_at_acquisition": 66,
+        "sex": "M"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2023-12-11",
+        "radiologist_conclusion": "Large right pleural effusion with associated right lower lobe collapse. No active tuberculosis identified.",
+        "positive_findings": [
+          {
+            "condition": "Pleural Effusion",
+            "status": "active",
+            "icd10": "J90",
+            "snomed_ct": "60046008",
+            "laterality": "right",
+            "location": "pleural space",
+            "descriptors": ["large", "blunting of costophrenic angle", "mediastinal shift"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          },
+          {
+            "condition": "Lobar Collapse",
+            "status": "active",
+            "icd10": "J98.1",
+            "snomed_ct": "40122008",
+            "laterality": "right",
+            "location": "lower lobe",
+            "descriptors": ["atelectasis", "volume loss"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    },
+    {
+      "study_id": "ms-00009",
+      "image_file": "9.png",
+      "acquisition_date": "2024-03-02",
+      "patient_demographics": {
+        "age_at_acquisition": 52,
+        "sex": "F"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2024-03-02",
+        "radiologist_conclusion": "Cardiomegaly with bilateral perihilar haziness and Kerley B lines, in keeping with cardiac failure.",
+        "positive_findings": [
+          {
+            "condition": "Congestive Heart Failure",
+            "status": "active",
+            "icd10": "I50.9",
+            "snomed_ct": "42343007",
+            "laterality": "bilateral",
+            "location": "perihilar",
+            "descriptors": ["cardiomegaly", "perihilar haziness", "Kerley B lines", "upper lobe diversion"],
+            "certainty": "definite",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    },
+    {
+      "study_id": "ms-00010",
+      "image_file": "10.png",
+      "acquisition_date": "2023-06-19",
+      "patient_demographics": {
+        "age_at_acquisition": 44,
+        "sex": "M"
+      },
+      "image_metadata": {
+        "modality": "CR",
+        "view_position": "PA",
+        "pixel_spacing_mm": [0.143, 0.143],
+        "image_dimensions": [2048, 2048],
+        "source_vna": "AWE",
+        "deid_method": "LaurelBridge"
+      },
+      "report_findings": {
+        "report_date": "2023-06-19",
+        "radiologist_conclusion": "Right upper lobe cavitating lesion with surrounding consolidation. Highly suspicious for active tuberculosis. Recommend sputum AFB.",
+        "positive_findings": [
+          {
+            "condition": "Tuberculosis",
+            "status": "active",
+            "icd10": "A15.0",
+            "snomed_ct": "154283005",
+            "laterality": "right",
+            "location": "upper lobe",
+            "descriptors": ["cavitation", "surrounding consolidation", "satellite nodules"],
+            "certainty": "probable",
+            "source": "hl7_report_nlp"
+          }
+        ],
+        "incidental_findings": []
+      }
+    }
+  ]
+}
