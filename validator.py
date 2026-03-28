@@ -1,149 +1,1058 @@
 """
-Simplest possible Bittensor subnet validator. Simply burns everything to UID 0.
+SotaRad Subnet Validator
+========================
+
+What is measured
+----------------
+Each miner's radiology pre-screening model is scored with **Fβ** (default β = 2,
+emphasising recall) on **public** evaluation samples whose timestamps are strictly
+after the model's on-chain submission time plus a configurable delay.  This rewards
+generalisation: models must perform well on cases they could not have seen during
+training.
+
+Miner interface (Chutes / OpenAI-compatible vision endpoint)
+-------------------------------------------------------------
+Miners deploy a vision-language model to Chutes and commit the following JSON to
+the Bittensor chain (rate-limited to ~1 per 100 blocks):
+
+    {
+        "repo":     "hf-username/model-name",   # Hugging Face repo ID
+        "revision": "abc1234...",               # git commit SHA (full or short)
+        "chute_id": "chutes-deployment-uuid",   # Chutes deployment identifier
+        "params":   2000000000                  # parameter count (optional, tie-break)
+    }
+
+Validators route binary-classification inference requests to each miner's Chutes
+deployment via the OpenAI-compatible chat-completions endpoint:
+
+    POST https://llm.chutes.ai/v1/chat/completions
+    {
+        "model": "<chute_id>",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "<image_url>"}},
+                {"type": "text",      "text": "<INFERENCE_PROMPT>"}
+            ]
+        }],
+        "max_tokens": 20,
+        "temperature": 0.0
+    }
+
+    Expected response text: "positive" | "negative"
+    ("positive" = screen positive / disease flagged; anything else = negative)
+
+Scoring (per evaluation day)
+----------------------------
+A confusion matrix is accumulated over the sample batch:
+    TP: predicted positive, actually positive
+    FP: predicted positive, actually negative
+    FN: predicted negative, actually positive  ← critical for screening
+    TN: predicted negative, actually negative
+
+    Precision = TP / (TP + FP)
+    Recall    = TP / (TP + FN)
+    Fβ        = (1 + β²) × P × R / (β² × P + R)    [β default = 2]
+
+Zero-denominator cases return 0.0 and are documented.
+
+Tier incentives (all values configurable)
+------------------------------------------
+    Tier A (95 %):  top-1 miner by mean Fβ over last 5 completed days
+    Tier B  (2 %):  top 10 % by mean Fβ over last 4 days
+    Tier C (1.5 %): top 20 % over last 3 days
+    Tier D  (1 %):  top 30 % over last 2 days
+    Tier E (0.5 %): top 40 % over last 1 day
+
+A single UID can qualify for multiple tiers; emissions are additive before
+normalisation into on-chain weights.  Tiers with no qualifying miners are skipped.
+
+Tie-breaking (§6 of ARCHITECTURE.md)
+--------------------------------------
+Within a tier: higher Fβ > higher recall > higher precision > fewer params > earlier
+on-chain commit block.
+
+Duplicate policy
+----------------
+Two commits are duplicates when they share the same (repo, revision) pair.  Only the
+earliest on-chain submitter per group is eligible for evaluation and incentives.
+Later duplicates are excluded until they commit a distinct model version.  Same-block
+ties are broken by lower UID.
+
+Dataset API contract (configurable base URL)
+--------------------------------------------
+    GET {DATASET_BASE_URL}/samples
+        ?after=<unix_float>&before=<unix_float>&limit=<int>
+    → {
+        "samples": [
+            {"id": str, "image_url": str, "label": 0|1, "timestamp": float},
+            ...
+        ]
+      }
+
+Reference baseline model: abersoz/Qwen2-VL-2B-Instruct-bnb-4bit-Radiology-mini
 """
 
-import os
-import time
-import click
+from __future__ import annotations
+
+import asyncio
+import json
 import logging
-import bittensor as bt
-from bittensor_wallet import Wallet
-import threading
+import os
+import sqlite3
 import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Optional
+
+import aiohttp
+import bittensor as bt
+import click
+from bittensor_wallet import Wallet
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
-HEARTBEAT_TIMEOUT = 600  # seconds
 
-def heartbeat_monitor(last_heartbeat, stop_event):
-    while not stop_event.is_set():
-        time.sleep(5)
-        if time.time() - last_heartbeat[0] > HEARTBEAT_TIMEOUT:
-            logger.error("No heartbeat detected in the last 600 seconds. Restarting process.")
-            logging.shutdown(); os.execv(sys.executable, [sys.executable] + sys.argv)
+# ── Tier configuration ────────────────────────────────────────────────────────
 
-@click.command()
-@click.option(
-    "--network",
-    default=lambda: os.getenv("NETWORK", "finney"),
-    help="Network to connect to (finney, test, local)",
-)
-@click.option(
-    "--netuid",
-    type=int,
-    default=lambda: int(os.getenv("NETUID", "1")),
-    help="Subnet netuid",
-)
-@click.option(
-    "--coldkey",
-    default=lambda: os.getenv("WALLET_NAME", "default"),
-    help="Wallet name",
-)
-@click.option(
-    "--hotkey",
-    default=lambda: os.getenv("HOTKEY_NAME", "default"),
-    help="Hotkey name",
-)
-@click.option(
-    "--log-level",
-    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
-    default=lambda: os.getenv("LOG_LEVEL", "INFO"),
-    help="Logging level",
-)
-def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
-    """Run the Chi subnet validator."""
-    # Set log level
-    logging.getLogger().setLevel(getattr(logging, log_level.upper()))
-    logger.info(f"Starting validator on network={network}, netuid={netuid}")
+@dataclass
+class TierConfig:
+    """Defines one emission tier."""
+    name: str
+    lookback_days: int
+    top_n: Optional[int]       # e.g. 1 for "top-1 miner"; mutually exclusive with top_pct
+    top_pct: Optional[float]   # e.g. 0.10 for "top 10 %"; mutually exclusive with top_n
+    emission_share: float      # fraction of total weight budget, e.g. 0.95
 
-    # Heartbeat setup
-    last_heartbeat = [time.time()]
-    stop_event = threading.Event()
-    heartbeat_thread = threading.Thread(target=heartbeat_monitor, args=(last_heartbeat, stop_event), daemon=True)
-    heartbeat_thread.start()
+
+DEFAULT_TIERS: list[TierConfig] = [
+    TierConfig("A", lookback_days=5, top_n=1,    top_pct=None, emission_share=0.95),
+    TierConfig("B", lookback_days=4, top_n=None, top_pct=0.10, emission_share=0.02),
+    TierConfig("C", lookback_days=3, top_n=None, top_pct=0.20, emission_share=0.015),
+    TierConfig("D", lookback_days=2, top_n=None, top_pct=0.30, emission_share=0.010),
+    TierConfig("E", lookback_days=1, top_n=None, top_pct=0.40, emission_share=0.005),
+]
+
+
+# ── Data classes ──────────────────────────────────────────────────────────────
+
+@dataclass
+class MinerCommit:
+    uid: int
+    hotkey: str
+    repo: str
+    revision: str
+    chute_id: str
+    params: int           # 0 if not provided by the miner
+    commit_block: int
+    commit_ts: float      # unix timestamp approximated from commit_block
+
+    @property
+    def duplicate_key(self) -> tuple[str, str]:
+        """Two commits are duplicates iff they share (repo, revision)."""
+        return (self.repo.lower().strip(), self.revision.lower().strip())
+
+
+@dataclass
+class EvalSample:
+    sample_id: str
+    image_url: str
+    label: int        # 1 = positive (disease present), 0 = negative
+    timestamp: float  # unix timestamp of this sample
+
+
+@dataclass
+class EvalResult:
+    uid: int
+    eval_date: str    # "YYYY-MM-DD"
+    tp: int
+    fp: int
+    fn: int
+    tn: int
+    sample_count: int
+    fb_score: float
+    precision_score: float
+    recall_score: float
+    chute_id: str
+    revision: str
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+def init_db(db_path: str) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS daily_scores (
+                uid              INTEGER NOT NULL,
+                eval_date        TEXT    NOT NULL,
+                fb_score         REAL    NOT NULL,
+                precision_score  REAL    NOT NULL,
+                recall_score     REAL    NOT NULL,
+                tp               INTEGER NOT NULL,
+                fp               INTEGER NOT NULL,
+                fn               INTEGER NOT NULL,
+                tn               INTEGER NOT NULL,
+                sample_count     INTEGER NOT NULL,
+                chute_id         TEXT    NOT NULL,
+                revision         TEXT    NOT NULL,
+                created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (uid, eval_date)
+            )
+        """)
+        con.commit()
+
+
+def upsert_daily_score(db_path: str, result: EvalResult) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            INSERT INTO daily_scores
+                (uid, eval_date, fb_score, precision_score, recall_score,
+                 tp, fp, fn, tn, sample_count, chute_id, revision)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(uid, eval_date) DO UPDATE SET
+                fb_score        = excluded.fb_score,
+                precision_score = excluded.precision_score,
+                recall_score    = excluded.recall_score,
+                tp              = excluded.tp,
+                fp              = excluded.fp,
+                fn              = excluded.fn,
+                tn              = excluded.tn,
+                sample_count    = excluded.sample_count,
+                chute_id        = excluded.chute_id,
+                revision        = excluded.revision
+        """, (
+            result.uid, result.eval_date, result.fb_score,
+            result.precision_score, result.recall_score,
+            result.tp, result.fp, result.fn, result.tn,
+            result.sample_count, result.chute_id, result.revision,
+        ))
+        con.commit()
+
+
+def query_scores_for_uid(
+    db_path: str,
+    uid: int,
+    since_date: str,
+    until_date: str,
+) -> list[dict]:
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT * FROM daily_scores
+            WHERE uid = ? AND eval_date >= ? AND eval_date <= ?
+            ORDER BY eval_date DESC
+        """, (uid, since_date, until_date)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def eval_already_ran_today(db_path: str, eval_date: str) -> bool:
+    with sqlite3.connect(db_path) as con:
+        row = con.execute(
+            "SELECT COUNT(*) FROM daily_scores WHERE eval_date = ?",
+            (eval_date,),
+        ).fetchone()
+    return row[0] > 0
+
+
+# ── Chain helpers ─────────────────────────────────────────────────────────────
+
+def _get_commit_block(
+    subtensor: bt.Subtensor,
+    netuid: int,
+    hotkey: str,
+    fallback: int,
+) -> int:
+    """
+    Query Commitments.CommitmentOf to get the block at which a miner committed.
+    Falls back to the provided value (e.g. metagraph.last_update[uid]) on any error.
+    """
+    try:
+        result = subtensor.substrate.query(
+            module="Commitments",
+            storage_function="CommitmentOf",
+            params=[netuid, hotkey],
+        )
+        if result is not None and result.value is not None:
+            val = result.value
+            if isinstance(val, dict):
+                return int(val.get("block", fallback))
+    except Exception as exc:
+        logger.debug(f"_get_commit_block({hotkey[:8]}): {exc}")
+    return fallback
+
+
+def _block_to_timestamp(
+    commit_block: int,
+    current_block: int,
+    block_time_s: float = 12.0,
+) -> float:
+    """Approximate unix timestamp of a historical block."""
+    blocks_ago = max(0, current_block - commit_block)
+    return time.time() - blocks_ago * block_time_s
+
+
+def fetch_all_commits(
+    subtensor: bt.Subtensor,
+    metagraph: bt.Metagraph,
+    netuid: int,
+    current_block: int,
+) -> list[MinerCommit]:
+    """
+    Read every miner's on-chain commitment, parse the JSON payload, and return
+    a list of MinerCommit objects.  UIDs with missing or malformed commitments
+    are silently skipped.
+    """
+    try:
+        raw: dict = subtensor.get_all_commitments(netuid)
+    except Exception as exc:
+        logger.warning(f"get_all_commitments failed ({exc}); falling back to per-UID queries")
+        raw = {}
+        for uid in range(int(metagraph.n)):
+            try:
+                data = subtensor.get_commitment(netuid, uid)
+                if data:
+                    raw[uid] = data
+            except Exception:
+                pass
+
+    commits: list[MinerCommit] = []
+    for uid_key, data_str in raw.items():
+        try:
+            uid = int(uid_key)
+        except (ValueError, TypeError):
+            continue
+
+        if uid >= len(metagraph.hotkeys):
+            continue
+
+        hotkey = metagraph.hotkeys[uid]
+
+        if isinstance(data_str, (bytes, bytearray)):
+            data_str = data_str.decode("utf-8", errors="replace")
+        data_str = str(data_str).strip()
+        if not data_str:
+            continue
+
+        try:
+            payload = json.loads(data_str)
+            repo     = str(payload["repo"]).strip()
+            revision = str(payload["revision"]).strip()
+            chute_id = str(payload["chute_id"]).strip()
+            params   = int(payload.get("params", 0))
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            logger.debug(f"UID {uid}: invalid commitment JSON – {exc}")
+            continue
+
+        if not repo or not revision or not chute_id:
+            logger.debug(f"UID {uid}: commitment missing required fields")
+            continue
+
+        try:
+            fallback_block = int(metagraph.last_update[uid])
+        except Exception:
+            fallback_block = current_block
+
+        commit_block = _get_commit_block(subtensor, netuid, hotkey, fallback_block)
+        commit_ts    = _block_to_timestamp(commit_block, current_block)
+
+        commits.append(MinerCommit(
+            uid=uid,
+            hotkey=hotkey,
+            repo=repo,
+            revision=revision,
+            chute_id=chute_id,
+            params=params,
+            commit_block=commit_block,
+            commit_ts=commit_ts,
+        ))
+
+    logger.info(f"Parsed {len(commits)} valid commitments from chain")
+    return commits
+
+
+# ── Duplicate detection ───────────────────────────────────────────────────────
+
+def deduplicate_commits(commits: list[MinerCommit]) -> list[MinerCommit]:
+    """
+    For each (repo, revision) group keep only the commit with the earliest
+    commit_block.  Tie-break: lower UID wins.  All other duplicates are
+    logged and excluded.
+    """
+    groups: dict[tuple[str, str], list[MinerCommit]] = {}
+    for c in commits:
+        groups.setdefault(c.duplicate_key, []).append(c)
+
+    eligible: list[MinerCommit] = []
+    for _key, group in groups.items():
+        winner = min(group, key=lambda c: (c.commit_block, c.uid))
+        eligible.append(winner)
+        for c in group:
+            if c.uid != winner.uid:
+                logger.info(
+                    f"UID {c.uid} ({c.repo}@{c.revision[:8]}) is a duplicate of "
+                    f"UID {winner.uid} (earliest submitter) – excluded from evaluation"
+                )
+    return eligible
+
+
+# ── Temporal eligibility filter ───────────────────────────────────────────────
+
+def filter_eligible(
+    commits: list[MinerCommit],
+    eval_delay_days: int,
+) -> list[MinerCommit]:
+    """
+    Keep only commits whose submission timestamp is at least eval_delay_days
+    before now (i.e. the model could not have been trained on today's data).
+    First eligible evaluation day is D+1 per ARCHITECTURE.md §2.3.
+    """
+    cutoff_ts = time.time() - eval_delay_days * 86_400
+    eligible = [c for c in commits if c.commit_ts < cutoff_ts]
+    excluded = len(commits) - len(eligible)
+    if excluded:
+        logger.info(f"{excluded} miner(s) excluded: committed too recently (< {eval_delay_days}d ago)")
+    return eligible
+
+
+# ── Dataset client ────────────────────────────────────────────────────────────
+
+async def fetch_eval_samples(
+    session: aiohttp.ClientSession,
+    dataset_base_url: str,
+    dataset_api_key: str,
+    after_ts: float,
+    before_ts: float,
+    limit: int = 100,
+) -> list[EvalSample]:
+    """
+    Fetch labelled evaluation samples from the configured public dataset API.
+
+    API contract:
+        GET {dataset_base_url}/samples?after=<ts>&before=<ts>&limit=<n>
+        → {"samples": [{"id": str, "image_url": str, "label": 0|1, "timestamp": float}]}
+    """
+    if not dataset_base_url:
+        logger.warning("DATASET_BASE_URL not configured – skipping evaluation")
+        return []
+
+    url     = f"{dataset_base_url.rstrip('/')}/samples"
+    params  = {"after": after_ts, "before": before_ts, "limit": limit}
+    headers = {}
+    if dataset_api_key:
+        headers["Authorization"] = f"Bearer {dataset_api_key}"
 
     try:
-        # Initialize wallet, subtensor, and metagraph
-        wallet = Wallet(name=coldkey, hotkey=hotkey)
-        subtensor = bt.Subtensor(network=network)
-        metagraph = bt.Metagraph(netuid=netuid, network=network)
+        async with session.get(
+            url, params=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except Exception as exc:
+        logger.error(f"Dataset API error: {exc}")
+        return []
 
-        # Sync metagraph
-        metagraph.sync(subtensor=subtensor)
-        logger.info(f"Metagraph synced: {metagraph.n} neurons at block {metagraph.block}")
+    samples: list[EvalSample] = []
+    for s in data.get("samples", []):
+        try:
+            samples.append(EvalSample(
+                sample_id=str(s["id"]),
+                image_url=str(s["image_url"]),
+                label=int(s["label"]),
+                timestamp=float(s["timestamp"]),
+            ))
+        except (KeyError, ValueError, TypeError):
+            continue
 
-        # Get our UID
+    return samples
+
+
+# ── Chutes inference client ───────────────────────────────────────────────────
+
+_INFERENCE_PROMPT: str = os.getenv(
+    "INFERENCE_PROMPT",
+    (
+        "You are a radiology pre-screening AI. Analyze this chest X-ray for signs "
+        "of active tuberculosis. Reply with exactly one word: positive (if TB signs "
+        "are present) or negative (if no TB signs are present)."
+    ),
+)
+
+
+async def query_chute(
+    session: aiohttp.ClientSession,
+    chutes_llm_url: str,
+    chutes_api_key: str,
+    chute_id: str,
+    image_url: str,
+    timeout_s: int = 60,
+) -> Optional[int]:
+    """
+    Send a vision-language inference request to a miner's Chutes deployment.
+
+    Returns:
+        1  – model predicted positive (disease present)
+        0  – model predicted negative
+        None – inference failed (timeout, network error, invalid response)
+    """
+    payload = {
+        "model": chute_id,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text",      "text": _INFERENCE_PROMPT},
+            ],
+        }],
+        "max_tokens": 20,
+        "temperature": 0.0,
+    }
+    url     = f"{chutes_llm_url.rstrip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {chutes_api_key}"}
+
+    try:
+        async with session.post(
+            url, json=payload, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            resp.raise_for_status()
+            result = await resp.json()
+        content: str = result["choices"][0]["message"]["content"]
+        return 1 if "positive" in content.lower() else 0
+    except Exception as exc:
+        logger.debug(f"Chute {chute_id[:16]}: inference error – {exc}")
+        return None
+
+
+# ── Fβ scoring ────────────────────────────────────────────────────────────────
+
+def fbeta_score(precision: float, recall: float, beta: float) -> float:
+    """Standard Fβ formula.  Returns 0.0 when the denominator is zero."""
+    b2    = beta * beta
+    denom = b2 * precision + recall
+    if denom == 0.0:
+        return 0.0
+    return (1.0 + b2) * precision * recall / denom
+
+
+def compute_metrics(
+    tp: int, fp: int, fn: int, beta: float
+) -> tuple[float, float, float]:
+    """Returns (precision, recall, fb_score) with safe zero-denominator handling."""
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    fb        = fbeta_score(precision, recall, beta)
+    return precision, recall, fb
+
+
+# ── Evaluator ─────────────────────────────────────────────────────────────────
+
+async def evaluate_miner(
+    session: aiohttp.ClientSession,
+    commit: MinerCommit,
+    samples: list[EvalSample],
+    chutes_llm_url: str,
+    chutes_api_key: str,
+    chutes_timeout: int,
+    beta: float,
+    eval_date: str,
+) -> Optional[EvalResult]:
+    """
+    Run inference for one miner across the sample batch and compute Fβ.
+    Returns None if all inference calls failed.
+    """
+    tasks = [
+        query_chute(
+            session, chutes_llm_url, chutes_api_key,
+            commit.chute_id, s.image_url, chutes_timeout,
+        )
+        for s in samples
+    ]
+    predictions = await asyncio.gather(*tasks)
+
+    tp = fp = fn = tn = evaluated = 0
+    for sample, pred in zip(samples, predictions):
+        if pred is None:
+            continue
+        evaluated += 1
+        actual = sample.label
+        if pred == 1 and actual == 1:
+            tp += 1
+        elif pred == 1 and actual == 0:
+            fp += 1
+        elif pred == 0 and actual == 1:
+            fn += 1
+        else:
+            tn += 1
+
+    if evaluated == 0:
+        logger.warning(f"UID {commit.uid} ({commit.chute_id[:16]}): all inference calls failed")
+        return None
+
+    precision, recall, fb = compute_metrics(tp, fp, fn, beta)
+    logger.info(
+        f"UID {commit.uid} | {commit.repo}@{commit.revision[:8]} | "
+        f"Fβ={fb:.4f}  P={precision:.4f}  R={recall:.4f}  "
+        f"TP={tp}  FP={fp}  FN={fn}  TN={tn}  n={evaluated}"
+    )
+    return EvalResult(
+        uid=commit.uid,
+        eval_date=eval_date,
+        tp=tp, fp=fp, fn=fn, tn=tn,
+        sample_count=evaluated,
+        fb_score=fb,
+        precision_score=precision,
+        recall_score=recall,
+        chute_id=commit.chute_id,
+        revision=commit.revision,
+    )
+
+
+async def run_daily_evaluation(
+    subtensor: bt.Subtensor,
+    metagraph: bt.Metagraph,
+    netuid: int,
+    current_block: int,
+    db_path: str,
+    dataset_base_url: str,
+    dataset_api_key: str,
+    chutes_llm_url: str,
+    chutes_api_key: str,
+    chutes_timeout: int,
+    chutes_max_concurrent: int,
+    eval_samples_per_day: int,
+    eval_delay_days: int,
+    beta: float,
+) -> list[MinerCommit]:
+    """
+    One complete daily evaluation pass.  Returns the list of eligible commits
+    so the caller can cache them for weight-setting between evaluations.
+    """
+    today = date.today().isoformat()
+    logger.info(f"=== Daily evaluation starting for {today} ===")
+
+    # 1. Discover all miner commitments
+    commits  = await asyncio.to_thread(fetch_all_commits, subtensor, metagraph, netuid, current_block)
+
+    # 2. Dedup: only the earliest submitter per (repo, revision) is eligible
+    eligible = deduplicate_commits(commits)
+
+    # 3. Temporal filter: submission must predate today by at least eval_delay_days
+    eligible = filter_eligible(eligible, eval_delay_days)
+    logger.info(f"{len(eligible)} miner(s) eligible for today's evaluation")
+
+    if not eligible:
+        logger.info("No eligible miners – skipping inference pass")
+        return eligible
+
+    # 4. Fetch labelled evaluation samples from the public dataset API
+    #    Window: last 24 h (today's window); each miner also filtered by its own cutoff below
+    now           = time.time()
+    eval_end_ts   = now
+    eval_start_ts = now - 86_400
+
+    async with aiohttp.ClientSession() as session:
+        samples = await fetch_eval_samples(
+            session, dataset_base_url, dataset_api_key,
+            after_ts=eval_start_ts,
+            before_ts=eval_end_ts,
+            limit=eval_samples_per_day,
+        )
+
+        if not samples:
+            logger.warning("No evaluation samples returned – aborting evaluation pass")
+            return eligible
+
+        logger.info(f"Fetched {len(samples)} evaluation samples from dataset API")
+
+        # 5. Evaluate each eligible miner (bounded concurrency via semaphore)
+        sem = asyncio.Semaphore(chutes_max_concurrent)
+
+        async def _eval_one(commit: MinerCommit) -> Optional[EvalResult]:
+            async with sem:
+                # Only use samples whose timestamp is strictly after this miner's
+                # training cutoff (commit_ts + delay), enforcing temporal integrity.
+                miner_cutoff = commit.commit_ts + eval_delay_days * 86_400
+                miner_samples = [s for s in samples if s.timestamp > miner_cutoff]
+                if not miner_samples:
+                    logger.debug(
+                        f"UID {commit.uid}: no samples pass temporal filter "
+                        f"(need ts > {miner_cutoff:.0f})"
+                    )
+                    return None
+                return await evaluate_miner(
+                    session, commit, miner_samples,
+                    chutes_llm_url, chutes_api_key, chutes_timeout, beta, today,
+                )
+
+        results = await asyncio.gather(*[_eval_one(c) for c in eligible])
+
+    # 6. Persist non-None results to SQLite
+    saved = 0
+    for r in results:
+        if r is not None:
+            await asyncio.to_thread(upsert_daily_score, db_path, r)
+            saved += 1
+
+    logger.info(f"=== Daily evaluation complete: {saved}/{len(eligible)} miners scored ===")
+    return eligible
+
+
+# ── Tier engine ───────────────────────────────────────────────────────────────
+
+def _lookback_date_range(today: str, lookback_days: int) -> tuple[str, str]:
+    d     = date.fromisoformat(today)
+    since = d - timedelta(days=lookback_days - 1)
+    return since.isoformat(), today
+
+
+def compute_tier_weights(
+    db_path: str,
+    eligible_commits: list[MinerCommit],
+    tiers: list[TierConfig],
+    today: str,
+) -> dict[int, float]:
+    """
+    Compute raw emission shares for each eligible UID across all tiers.
+    A UID can accumulate emissions from multiple tiers; shares are additive.
+    Returns {uid: raw_emission} (not yet normalised to sum=1).
+    """
+    eligible_uids  = [c.uid for c in eligible_commits]
+    uid_to_commit  = {c.uid: c for c in eligible_commits}
+    emissions: dict[int, float] = {uid: 0.0 for uid in eligible_uids}
+
+    for tier in tiers:
+        since_date, until_date = _lookback_date_range(today, tier.lookback_days)
+
+        # Build aggregate Fβ (mean) over the lookback window for each UID
+        # Ranking tuple: (-mean_fb, -mean_recall, -mean_precision, params, commit_block)
+        ranked: list[tuple[float, float, float, int, int, int]] = []
+        for uid in eligible_uids:
+            scores = query_scores_for_uid(db_path, uid, since_date, until_date)
+            if not scores:
+                continue
+            n          = len(scores)
+            mean_fb    = sum(s["fb_score"]        for s in scores) / n
+            mean_rec   = sum(s["recall_score"]    for s in scores) / n
+            mean_prec  = sum(s["precision_score"] for s in scores) / n
+            c          = uid_to_commit[uid]
+            params     = c.params if c.params > 0 else 10**12  # unknown → treated as very large
+            ranked.append((mean_fb, mean_rec, mean_prec, params, c.commit_block, uid))
+
+        if not ranked:
+            logger.debug(f"Tier {tier.name}: no UIDs with scores in [{since_date}, {until_date}]")
+            continue
+
+        # Sort by tie-breaking rules (§6): higher Fβ > recall > precision > fewer params > earlier block
+        ranked.sort(key=lambda x: (-x[0], -x[1], -x[2], x[3], x[4]))
+
+        n_total = len(ranked)
+        if tier.top_n is not None:
+            qualifiers = [row[5] for row in ranked[: tier.top_n]]
+        else:
+            top_k      = max(1, round(tier.top_pct * n_total))
+            qualifiers = [row[5] for row in ranked[: top_k]]
+
+        if not qualifiers:
+            continue
+
+        share_per_uid = tier.emission_share / len(qualifiers)
+        for uid in qualifiers:
+            emissions[uid] += share_per_uid
+            logger.debug(f"Tier {tier.name}: UID {uid} += {share_per_uid:.4f}")
+
+        logger.info(
+            f"Tier {tier.name}: {len(qualifiers)} qualifier(s) | "
+            f"{share_per_uid:.4f} each | window [{since_date}, {until_date}]"
+        )
+
+    return emissions
+
+
+# ── Weight setting ────────────────────────────────────────────────────────────
+
+async def set_weights_from_tiers(
+    subtensor: bt.Subtensor,
+    wallet: Wallet,
+    netuid: int,
+    db_path: str,
+    tiers: list[TierConfig],
+    eligible_commits: list[MinerCommit],
+) -> bool:
+    """Derive weights from tier emissions and submit them on chain."""
+    if not eligible_commits:
+        logger.warning("No eligible commits – setting sentinel weight on UID 0")
+        return await asyncio.to_thread(
+            subtensor.set_weights,
+            wallet=wallet, netuid=netuid, uids=[0], weights=[1.0],
+            wait_for_inclusion=True, wait_for_finalization=False,
+        )
+
+    today     = date.today().isoformat()
+    emissions = await asyncio.to_thread(
+        compute_tier_weights, db_path, eligible_commits, tiers, today
+    )
+
+    total = sum(emissions.values())
+    if total == 0.0:
+        logger.warning("All tier emissions are zero (no daily scores yet) – deferring weight update")
+        return False
+
+    uids    = list(emissions.keys())
+    weights = [emissions[u] / total for u in uids]
+
+    logger.info(f"Setting weights for {len(uids)} UID(s) | total raw emission = {total:.4f}")
+    top_display = sorted(zip(uids, weights), key=lambda x: -x[1])[:10]
+    for uid, w in top_display:
+        logger.info(f"  UID {uid:4d}  weight={w:.4f}")
+
+    success = await asyncio.to_thread(
+        subtensor.set_weights,
+        wallet=wallet,
+        netuid=netuid,
+        uids=uids,
+        weights=weights,
+        wait_for_inclusion=True,
+        wait_for_finalization=False,
+    )
+    return bool(success)
+
+
+# ── Heartbeat monitor ─────────────────────────────────────────────────────────
+
+def _heartbeat_monitor(
+    last_heartbeat: list[float],
+    stop_event: threading.Event,
+    timeout: int,
+) -> None:
+    while not stop_event.is_set():
+        time.sleep(5)
+        if time.time() - last_heartbeat[0] > timeout:
+            logger.error(f"No heartbeat in {timeout}s – restarting process")
+            logging.shutdown()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ── Main validator loop ───────────────────────────────────────────────────────
+
+async def validator_loop(
+    network: str,
+    netuid: int,
+    coldkey: str,
+    hotkey: str,
+    db_path: str,
+    dataset_base_url: str,
+    dataset_api_key: str,
+    chutes_llm_url: str,
+    chutes_api_key: str,
+    chutes_timeout: int,
+    chutes_max_concurrent: int,
+    eval_samples_per_day: int,
+    eval_delay_days: int,
+    beta: float,
+    tiers: list[TierConfig],
+    heartbeat_timeout: int,
+) -> None:
+    # ── Heartbeat thread ──────────────────────────────────────────────────────
+    last_heartbeat: list[float] = [time.time()]
+    stop_event = threading.Event()
+    hb_thread  = threading.Thread(
+        target=_heartbeat_monitor,
+        args=(last_heartbeat, stop_event, heartbeat_timeout),
+        daemon=True,
+    )
+    hb_thread.start()
+
+    try:
+        # ── Initialise chain connections ──────────────────────────────────────
+        wallet     = Wallet(name=coldkey, hotkey=hotkey)
+        subtensor  = bt.Subtensor(network=network)
+        metagraph  = bt.Metagraph(netuid=netuid, network=network)
+        await asyncio.to_thread(metagraph.sync, subtensor=subtensor)
+        logger.info(f"Metagraph synced: {metagraph.n} neurons @ block {metagraph.block}")
+
         my_hotkey = wallet.hotkey.ss58_address
         if my_hotkey not in metagraph.hotkeys:
             logger.error(f"Hotkey {my_hotkey} not registered on netuid {netuid}")
-            stop_event.set()
             return
         my_uid = metagraph.hotkeys.index(my_hotkey)
         logger.info(f"Validator UID: {my_uid}")
 
-        # Get tempo for this subnet
-        tempo = subtensor.get_subnet_hyperparameters(netuid).tempo
-        logger.info(f"Subnet tempo: {tempo} blocks")
+        hyperparams       = await asyncio.to_thread(subtensor.get_subnet_hyperparameters, netuid)
+        tempo             = int(hyperparams.tempo)
+        weights_rate_limit = int(getattr(hyperparams, "weights_rate_limit", tempo))
+        logger.info(f"Tempo: {tempo} blocks | Weights rate limit: {weights_rate_limit} blocks")
 
-        last_weight_block = 0
+        # ── Initialise DB ─────────────────────────────────────────────────────
+        await asyncio.to_thread(init_db, db_path)
 
-        # Main validator loop
+        # ── State ─────────────────────────────────────────────────────────────
+        last_weight_block: int        = 0
+        last_eval_date:    str        = ""
+        eligible_commits:  list[MinerCommit] = []
+
+        # Pre-populate eligible_commits from chain so weight-setting works immediately
+        current_block = await asyncio.to_thread(subtensor.get_current_block)
+        commits       = await asyncio.to_thread(fetch_all_commits, subtensor, metagraph, netuid, current_block)
+        eligible_commits = filter_eligible(deduplicate_commits(commits), eval_delay_days)
+
+        # ── Main loop ─────────────────────────────────────────────────────────
         while True:
             try:
-                # Sync metagraph
-                metagraph.sync(subtensor=subtensor)
-                current_block = subtensor.get_current_block()
+                await asyncio.to_thread(metagraph.sync, subtensor=subtensor)
+                current_block      = await asyncio.to_thread(subtensor.get_current_block)
+                last_heartbeat[0]  = time.time()
+                today              = date.today().isoformat()
 
-                # Heartbeat: update the last heartbeat timestamp
-                last_heartbeat[0] = time.time()
+                # ── Daily evaluation trigger ──────────────────────────────────
+                already_ran = await asyncio.to_thread(eval_already_ran_today, db_path, today)
+                if today != last_eval_date and not already_ran:
+                    last_eval_date   = today  # set before to avoid tight-loop retries on failure
+                    eligible_commits = await run_daily_evaluation(
+                        subtensor=subtensor,
+                        metagraph=metagraph,
+                        netuid=netuid,
+                        current_block=current_block,
+                        db_path=db_path,
+                        dataset_base_url=dataset_base_url,
+                        dataset_api_key=dataset_api_key,
+                        chutes_llm_url=chutes_llm_url,
+                        chutes_api_key=chutes_api_key,
+                        chutes_timeout=chutes_timeout,
+                        chutes_max_concurrent=chutes_max_concurrent,
+                        eval_samples_per_day=eval_samples_per_day,
+                        eval_delay_days=eval_delay_days,
+                        beta=beta,
+                    )
 
-                # Check if we should set weights (once per tempo)
-                blocks_since_last = current_block - last_weight_block
-                if blocks_since_last >= tempo:
-                    logger.info(f"Block {current_block}: Setting weights (tempo={tempo})")
-
-                    # Set 100% weight on UID 0
-                    uids = [0]
-                    weights = [1.0]
-
-                    # Set weights on chain
-                    success = subtensor.set_weights(
+                # ── Weight-setting trigger ────────────────────────────────────
+                blocks_since_weights = current_block - last_weight_block
+                if blocks_since_weights >= weights_rate_limit:
+                    logger.info(
+                        f"Block {current_block}: setting weights "
+                        f"({blocks_since_weights} blocks since last update)"
+                    )
+                    success = await set_weights_from_tiers(
+                        subtensor=subtensor,
                         wallet=wallet,
                         netuid=netuid,
-                        uids=uids,
-                        weights=weights,
-                        wait_for_inclusion=True,
-                        wait_for_finalization=False,
+                        db_path=db_path,
+                        tiers=tiers,
+                        eligible_commits=eligible_commits,
                     )
-
                     if success:
-                        logger.info(f"Successfully set weights for {len(uids)} neurons")
                         last_weight_block = current_block
+                        logger.info(f"Weights set at block {current_block}")
                     else:
-                        logger.warning("Failed to set weights")
+                        logger.warning("set_weights returned False; will retry next tempo")
                 else:
                     logger.debug(
-                        f"Block {current_block}: Waiting for tempo "
-                        f"({blocks_since_last}/{tempo} blocks)"
+                        f"Block {current_block}: waiting for weight update "
+                        f"({blocks_since_weights}/{weights_rate_limit} blocks)"
                     )
 
-                # Sleep for ~1 block
-                time.sleep(12)
+                await asyncio.sleep(12)
 
             except KeyboardInterrupt:
                 logger.info("Validator stopped by user")
                 break
-            except Exception as e:
-                logger.error(f"Error in validator loop: {e}")
-                time.sleep(12)
+            except Exception as exc:
+                logger.error(f"Loop error: {exc}", exc_info=True)
+                await asyncio.sleep(30)
+
     finally:
         stop_event.set()
-        heartbeat_thread.join(timeout=2)
+        hb_thread.join(timeout=2)
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
+
+@click.command()
+@click.option("--network",              default=lambda: os.getenv("NETWORK", "finney"),
+              help="Subtensor network (finney | test | local)")
+@click.option("--netuid",               type=int, default=lambda: int(os.getenv("NETUID", "1")),
+              help="Subnet netuid")
+@click.option("--coldkey",              default=lambda: os.getenv("WALLET_NAME", "default"),
+              help="Wallet coldkey name")
+@click.option("--hotkey",               default=lambda: os.getenv("HOTKEY_NAME", "default"),
+              help="Wallet hotkey name")
+@click.option("--log-level",            type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+              default=lambda: os.getenv("LOG_LEVEL", "INFO"))
+@click.option("--db-path",              default=lambda: os.getenv("DB_PATH", "validator_scores.db"),
+              help="SQLite file for daily evaluation scores")
+@click.option("--dataset-base-url",     default=lambda: os.getenv("DATASET_BASE_URL", ""),
+              help="Public dataset API base URL")
+@click.option("--dataset-api-key",      default=lambda: os.getenv("DATASET_API_KEY", ""),
+              help="Bearer token for dataset API (if required)")
+@click.option("--chutes-api-key",       default=lambda: os.getenv("CHUTES_API_KEY", ""),
+              help="Chutes API key (cpk_...)")
+@click.option("--chutes-llm-url",       default=lambda: os.getenv("CHUTES_LLM_URL", "https://llm.chutes.ai/v1"),
+              help="Chutes OpenAI-compatible base URL")
+@click.option("--chutes-timeout",       type=int, default=lambda: int(os.getenv("CHUTES_TIMEOUT", "60")),
+              help="Per-inference request timeout (seconds)")
+@click.option("--chutes-max-concurrent",type=int, default=lambda: int(os.getenv("CHUTES_MAX_CONCURRENT", "4")),
+              help="Max parallel miner evaluations")
+@click.option("--eval-samples-per-day", type=int, default=lambda: int(os.getenv("EVAL_SAMPLES_PER_DAY", "100")),
+              help="Max dataset samples fetched per daily evaluation")
+@click.option("--eval-delay-days",      type=int, default=lambda: int(os.getenv("EVAL_DELAY_DAYS", "1")),
+              help="Min days after model submission before it qualifies for evaluation")
+@click.option("--fbeta-beta",           type=float, default=lambda: float(os.getenv("FBETA_BETA", "2.0")),
+              help="β parameter for Fβ scoring (>1 weights recall more than precision)")
+@click.option("--heartbeat-timeout",    type=int, default=lambda: int(os.getenv("HEARTBEAT_TIMEOUT", "600")),
+              help="Seconds without loop heartbeat before auto-restart")
+def main(
+    network: str,
+    netuid: int,
+    coldkey: str,
+    hotkey: str,
+    log_level: str,
+    db_path: str,
+    dataset_base_url: str,
+    dataset_api_key: str,
+    chutes_api_key: str,
+    chutes_llm_url: str,
+    chutes_timeout: int,
+    chutes_max_concurrent: int,
+    eval_samples_per_day: int,
+    eval_delay_days: int,
+    fbeta_beta: float,
+    heartbeat_timeout: int,
+) -> None:
+    """SotaRad subnet validator: scores radiology pre-screening models via Fβ."""
+    logging.getLogger().setLevel(getattr(logging, log_level.upper()))
+    logger.info(
+        f"Starting SotaRad validator | network={network} netuid={netuid} "
+        f"β={fbeta_beta} eval_delay={eval_delay_days}d samples/day={eval_samples_per_day}"
+    )
+    asyncio.run(validator_loop(
+        network=network,
+        netuid=netuid,
+        coldkey=coldkey,
+        hotkey=hotkey,
+        db_path=db_path,
+        dataset_base_url=dataset_base_url,
+        dataset_api_key=dataset_api_key,
+        chutes_llm_url=chutes_llm_url,
+        chutes_api_key=chutes_api_key,
+        chutes_timeout=chutes_timeout,
+        chutes_max_concurrent=chutes_max_concurrent,
+        eval_samples_per_day=eval_samples_per_day,
+        eval_delay_days=eval_delay_days,
+        beta=fbeta_beta,
+        tiers=DEFAULT_TIERS,
+        heartbeat_timeout=heartbeat_timeout,
+    ))
+
 
 if __name__ == "__main__":
     main()
