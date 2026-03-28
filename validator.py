@@ -827,6 +827,14 @@ async def run_daily_evaluation(
 # ── Tier engine ───────────────────────────────────────────────────────────────
 
 def _lookback_date_range(today: str, lookback_days: int) -> tuple[str, str]:
+    """
+    Return (since_date, today) covering exactly lookback_days calendar days.
+
+    Convention (fixed globally per ARCHITECTURE.md §5.2): the window **includes
+    today's scores** (i.e. the k days are today, yesterday, … today-(k-1)).
+    If today's evaluation has not yet run, the DB simply returns no row for
+    today and the mean is computed from the available completed days only.
+    """
     d     = date.fromisoformat(today)
     since = d - timedelta(days=lookback_days - 1)
     return since.isoformat(), today
@@ -906,26 +914,31 @@ async def set_weights_from_tiers(
     eligible_commits: list[MinerCommit],
 ) -> bool:
     """Derive weights from tier emissions and submit them on chain."""
-    if not eligible_commits:
-        logger.warning("No eligible commits – setting sentinel weight on UID 0")
-        return await asyncio.to_thread(
+    async def _burn_to_uid0(reason: str) -> bool:
+        logger.warning(f"{reason} – burning weight to UID 0")
+        return bool(await asyncio.to_thread(
             subtensor.set_weights,
             wallet=wallet, netuid=netuid, uids=[0], weights=[1.0],
             wait_for_inclusion=True, wait_for_finalization=False,
-        )
+        ))
+
+    if not eligible_commits:
+        return await _burn_to_uid0("No eligible commits")
 
     today     = date.today().isoformat()
     emissions = await asyncio.to_thread(
         compute_tier_weights, db_path, eligible_commits, tiers, today
     )
 
-    total = sum(emissions.values())
-    if total == 0.0:
-        logger.warning("All tier emissions are zero (no daily scores yet) – deferring weight update")
-        return False
+    # Only submit UIDs that actually earned emissions; zero-weight UIDs are
+    # excluded from the set_weights call to keep the payload clean.
+    active = {uid: em for uid, em in emissions.items() if em > 0.0}
+    if not active:
+        return await _burn_to_uid0("All tier emissions are zero (no daily scores yet)")
 
-    uids    = list(emissions.keys())
-    weights = [emissions[u] / total for u in uids]
+    total   = sum(active.values())
+    uids    = list(active.keys())
+    weights = [active[u] / total for u in uids]
 
     logger.info(f"Setting weights for {len(uids)} UID(s) | total raw emission = {total:.4f}")
     top_display = sorted(zip(uids, weights), key=lambda x: -x[1])[:10]
