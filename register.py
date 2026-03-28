@@ -170,11 +170,8 @@ def _block_to_human_ts(commit_block: int, current_block: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _blocks_until_eligible(commit_block: int, current_block: int, eval_delay_days: int) -> int:
-    """Blocks remaining before this commitment qualifies for evaluation."""
-    delay_blocks = int(eval_delay_days * 86_400 / _BLOCK_TIME_S)
-    eligible_at  = commit_block + delay_blocks
-    return max(0, eligible_at - current_block)
+def _blocks_since_commit(commit_block: int, current_block: int) -> int:
+    return max(0, current_block - commit_block)
 
 
 # ── Shared CLI options ────────────────────────────────────────────────────────
@@ -287,12 +284,8 @@ def commit(
 # ── status ────────────────────────────────────────────────────────────────────
 
 @cli.command()
-@click.option("--eval-delay-days", type=int, default=lambda: int(os.getenv("EVAL_DELAY_DAYS", "1")),
-              show_default=True,
-              help="Evaluation delay in days (must match validator's EVAL_DELAY_DAYS setting)")
 @_chain_options
 def status(
-    eval_delay_days: int,
     network: str,
     netuid: int,
     coldkey: str,
@@ -357,26 +350,17 @@ def status(
         click.secho(f"\n  ✗ Commitment missing required fields: {missing}", fg="red")
         return
 
-    # ── Eligibility ───────────────────────────────────────────────────────────
-    click.echo("\n── Evaluation eligibility ───────────────────────────────────")
-    remaining = _blocks_until_eligible(commit_block, current_block, eval_delay_days)
-    if remaining == 0:
-        click.secho(
-            f"  ✓ Eligible for evaluation  "
-            f"(committed {current_block - commit_block} blocks ago, "
-            f"delay = {eval_delay_days} day(s))",
-            fg="green",
-        )
-    else:
-        remaining_s = int(remaining * _BLOCK_TIME_S)
-        click.secho(
-            f"  ⏳ Not yet eligible  "
-            f"(~{remaining} blocks / "
-            f"~{remaining_s // 3600}h {(remaining_s % 3600) // 60}m remaining)",
-            fg="yellow",
-        )
-        eligible_block = commit_block + int(eval_delay_days * 86_400 / _BLOCK_TIME_S)
-        click.echo(f"     Eligible from block ~{eligible_block}")
+    # ── Age ───────────────────────────────────────────────────────────────────
+    blocks_old = _blocks_since_commit(commit_block, current_block)
+    age_s      = int(blocks_old * _BLOCK_TIME_S)
+    age_h      = age_s // 3600
+    age_m      = (age_s % 3600) // 60
+    click.echo(f"\n── Commitment age ───────────────────────────────────────────")
+    click.echo(f"  Committed {blocks_old} blocks ago (~{age_h}h {age_m}m)")
+    click.echo(
+        "  Evaluation eligibility is controlled by the validator's "
+        "EVAL_DELAY_DAYS setting (default: 1 day after submission)."
+    )
 
 
 # ── check ─────────────────────────────────────────────────────────────────────

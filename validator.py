@@ -1134,6 +1134,8 @@ async def validator_loop(
               help="β parameter for Fβ scoring (>1 weights recall more than precision)")
 @click.option("--heartbeat-timeout",    type=int, default=lambda: int(os.getenv("HEARTBEAT_TIMEOUT", "600")),
               help="Seconds without loop heartbeat before auto-restart")
+@click.option("--mock",                 is_flag=True, default=lambda: os.getenv("MOCK", "").lower() == "true",
+              help="Use local mock servers: dataset API on :8100, Chutes on :8200 (see mock/)")
 def main(
     network: str,
     netuid: int,
@@ -1153,9 +1155,19 @@ def main(
     eval_delay_days: int,
     fbeta_beta: float,
     heartbeat_timeout: int,
+    mock: bool,
 ) -> None:
     """SotaRad subnet validator: scores radiology pre-screening models via Fβ."""
     logging.getLogger().setLevel(getattr(logging, log_level.upper()))
+
+    if mock:
+        dataset_base_url = dataset_base_url or "http://localhost:8100"
+        image_base_url   = image_base_url   or "http://localhost:8100/images"
+        chutes_llm_url   = "http://localhost:8200/v1"
+        chutes_api_key   = chutes_api_key   or "mock-key"
+        eval_delay_days  = 0  # bypass temporal filter so historical data is eligible
+        logger.info("Mock mode: dataset=:8100  chutes=:8200  eval_delay_days=0")
+
     parsed_conditions = _parse_target_conditions(target_conditions)
     logger.info(
         f"Starting SotaRad validator | network={network} netuid={netuid} "
