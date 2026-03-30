@@ -2,13 +2,17 @@
 
 This document describes **operational logic** for the radiology pre-screening subnet (see `docs/PROPOSAL.md`): workflows, data rules, configuration boundaries, and the **evaluation metric** (including one reference figure for **Fβ**). Training pipelines and miner client code are **out of scope** for this repository; the subnet defines how commitments are interpreted and how validators score models.
 
+The system prompt that drives model inference is maintained as a standalone importable module at `prompts/system_prompt.py`.
+
 ---
 
 ## 1. Scope and design axis
 
-**What is measured:** each miner’s model is scored with the **Fβ score** (see §4.4) on evaluation windows that are **strictly after** that model’s on-chain submission time, using a **public** evaluation dataset API.
+**What is measured:** for each chest X-ray study, the miner’s model is prompted to identify **which of the four target lung conditions are present**, producing a structured JSON array of findings (see §4.4 for the full evaluation protocol). The final scalar score per study is the **Fβ** computed from finding-level precision and recall against the ground-truth finding list. Models are evaluated on studies whose acquisition dates are **strictly after** each model’s on-chain submission time.
 
-**Why not plain accuracy or F1:** pre-screening must **minimize missed disease** (high **recall / sensitivity**). Operational efficiency and human workload also depend on **precision** (fewer false alarms). **Recall is more important than precision**, but precision still matters. **F1** weights precision and recall equally; **Fβ** with **β greater than 1** increases the penalty on low recall relative to low precision, which matches “don’t miss positives” better than F1.
+**Target conditions (v1):** Pneumonia, Tuberculosis, Bronchitis, Silicosis. These are the only conditions counted in scoring; findings outside this set are ignored.
+
+**Why Fβ and not plain accuracy:** pre-screening must **minimize missed disease** (high **recall / sensitivity**). Operational efficiency and human workload also depend on **precision** (fewer false alarms). **Recall is more important than precision**, but precision still matters. **F1** weights both equally; **Fβ** with **β greater than 1** tilts the score toward recall, matching “don’t miss positives” better than F1.
 
 - Training and fine-tuning happen off-chain and are **not** part of this repo.
 - Miners expose inference via **Chutes**; validators call the public inference API.
@@ -99,35 +103,64 @@ Concretely: implementation fixes a rule such as “only use samples with `timest
 
 - The **query shape** (query parameters for time period, pagination, task filters) is part of validator configuration so the same client can target different dataset deployments.
 
-### 4.4 Model evaluation: precision, recall, and Fβ
+### 4.4 Model evaluation: finding-level precision, recall, and Fβ
 
 #### 4.4.1 Inference pass
 
-For each **eligible** UID on evaluation day **E** (respecting §2.3 and §4.3), validators send standardized requests to the miner’s **Chutes** endpoint for every sample in that day’s evaluation batch (labels come from the dataset API / ground-truth provider, not from the miner).
+For each **eligible** UID on evaluation day **E** (respecting §2.3 and §4.3), validators send a request to the miner’s **Chutes** endpoint for every study in that day’s evaluation batch. Each request contains:
 
-#### 4.4.2 Task definition and confusion matrix
+- The **chest X-ray image** (base64 or URL per the standardized API contract).
+- The **patient demographics** block from the dataset record (`age_at_acquisition`, `sex`).
+- The **system prompt** defined in `prompts/system_prompt.py`, which instructs the model to output a JSON array of findings and specifies all controlled vocabulary.
 
-Evaluation is treated as **binary** at the scoring layer: a **positive** label means “screen positive / flag for further work” (disease-present or equivalent subnet-defined positive class); **negative** is the complement. From aggregate counts over the batch:
+The model must respond with a **JSON array** of zero or more finding objects. Each object must contain exactly the fields `condition`, `status`, `laterality`, `location`, and `certainty` (see §4.4.2). A **`descriptors` field is not part of the expected output** (ground-truth exports may still carry descriptors for provenance; validators ignore them for model JSON validation). Responses that cannot be parsed as valid JSON are treated as an empty array for that study.
 
-- **True positives (TP):** predicted positive, actually positive.  
-- **False negatives (FN):** predicted negative, actually positive (**missed case**—especially harmful in screening).  
-- **False positives (FP):** predicted positive, actually negative.  
-- **True negatives (TN):** predicted negative, actually negative.
+#### 4.4.2 Finding schema and controlled vocabulary
 
-Then, over the scored batch:
+Each finding produced by the model must conform to this schema:
 
-- **Precision** is the fraction of predicted positives that are correct: **TP / (TP + FP)** (of all cases the model called positive, how many were truly positive).
-- **Recall** (same as **sensitivity**) is the fraction of actual positives the model caught: **TP / (TP + FN)** (of all true disease-positive cases, how many the model flagged).
+| Field | Allowed values |
+|-------|---------------|
+| `condition` | `"Pneumonia"`, `"Tuberculosis"`, `"Bronchitis"`, `"Silicosis"` |
+| `status` | `"active"`, `"previous"` |
+| `laterality` | `"bilateral"`, `"left"`, `"right"` |
+| `location` | one or more location phrases, joined with `" and "`; segments must match **`laterality`**: see `LOCATION_LEFT_OR_RIGHT_ONLY`, `LOCATION_BILATERAL_EXCLUSIVE`, and `LOCATION_PLURAL_BY_SINGULAR` in `prompts/system_prompt.py` |
+| `certainty` | `"definite"`, `"probable"` |
+
+**Location and laterality:** if **`laterality` is `left` or `right`**, only **`LOCATION_LEFT_OR_RIGHT_ONLY`** strings are valid (singular zone/lobe/space). **`diffuse`**, **`hilar`**, and **`perihilar`** are **invalid** for left/right. If **`laterality` is `bilateral`**, use plural zone/lobe/space strings from **`LOCATION_PLURAL_BY_SINGULAR`** and/or the fixed bilateral-only tokens **`LOCATION_BILATERAL_EXCLUSIVE`** (no plural variants for those three). **`ALLOWED_LOCATIONS`** is the union of all strings that may appear.
+
+The model must **not** return **`descriptors`**. Fields `icd10`, `snomed_ct`, and `source` are **never** part of the expected output and are ignored during matching if present. Dataset ground truth may still include `descriptors` for audit only.
+
+The authoritative controlled vocabularies live in `prompts/system_prompt.py` (`TARGET_CONDITIONS`, `ALLOWED_STATUSES`, `LOCATION_PLURAL_BY_SINGULAR`, etc.) and are shared between the prompt and the validator scoring code.
+
+#### 4.4.3 Finding-level matching
+
+Validators compare the model’s predicted findings against the ground-truth `positive_findings` array from the dataset API for that study. Matching is done **per condition**:
+
+- **True positive (TP):** a target condition appears in both the model output and the ground truth for that study (match on `condition` field; other fields may be used for partial credit schemes in future versions but are not required for a basic TP in v1).
+- **False negative (FN):** a target condition is in the ground truth but absent from the model output.
+- **False positive (FP):** a target condition is in the model output but absent from the ground truth.
+
+Conditions outside the four targets are ignored in both sets before matching. Multiple findings with the same `condition` within one study count as one entry in the match set (v1 simplification; later versions may score field-level accuracy within a matched condition).
+
+Counts accumulate across **all studies** in the daily evaluation batch before computing Precision, Recall, and Fβ.
+
+#### 4.4.4 Precision, recall, and confusion counts
+
+From the batch-level aggregate TP, FP, FN counts:
+
+- **Precision** is the fraction of predicted conditions that are correct: **TP / (TP + FP)** (of all conditions the model flagged, how many were truly present).
+- **Recall** (sensitivity) is the fraction of true conditions the model caught: **TP / (TP + FN)** (of all conditions actually present, how many the model flagged).
 
 Implementation must define behavior when denominators are zero (e.g. **TP + FP = 0** or **TP + FN = 0**)—skip the day, assign a sentinel score, or use a documented fallback—so ranking stays well-defined.
 
-#### 4.4.3 Fβ formula (primary score)
+#### 4.4.5 Fβ formula (primary score)
 
 The **primary scalar score** for ranking and tiers is **Fβ**, where **β** (beta) is a **validator-configurable** positive number.
 
 **In words:** Fβ blends precision and recall into one number. The parameter **β** controls how much **recall** is weighted **relative to precision**: larger **β** means recall matters more in the blend; **β = 1** is the familiar **F1** (equal weight); **β less than 1** tilts toward precision.
 
-**As a formula** (same as common libraries such as [scikit-learn `fbeta_score](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.fbeta_score.html)`):
+**As a formula** (same as common libraries such as [scikit-learn `fbeta_score`](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.fbeta_score.html)):
 
 ```text
 Fβ = (1 + β²) × (Precision × Recall) / ((β² × Precision) + Recall)
@@ -139,25 +172,25 @@ Equivalently: take the product **Precision × Recall**, multiply by **(1 + β²)
 - **β greater than 1:** emphasizes **recall**—appropriate when **false negatives** (missed disease) hurt more than **false positives**; **F2** (β = 2) is a common screening-oriented choice.
 - **β less than 1:** emphasizes **precision**—not the default intent for this subnet.
 
-**Interpretation:** in the usual reading, **β** reflects **how many times more important recall is than precision** when trading them off inside this single score (see standard ML references and the figure below).
+**Interpretation:** **β** reflects **how many times more important recall is than precision** when trading them off inside this single score.
 
-**Subnet default:** expose **β** in validator config (e.g. default **β = 2** if the subnet wants recall to dominate the blend in line with F2-style screening—tune empirically).
+**Subnet default:** expose **β** in validator config (e.g. default **β = 2** if the subnet wants recall to dominate—tune empirically).
 
-**Implementation note:** match one documented convention and unit-test edge cases (empty batches, zero denominators).
+**Implementation note:** match one documented convention (scikit-learn `fbeta_score`) and unit-test edge cases (empty batches, zero denominators).
 
-#### 4.4.4 How varying β changes the score (reference figure)
+#### 4.4.6 How varying β changes the score (reference figure)
 
 The following figure fixes **precision at 0.5** and shows how **Fβ** rises as **recall** increases, for three settings: **F0.5** (precision-heavy), **F1** (balanced), and **F2** (recall-heavy). For the same recall, a **larger β** gives a **steeper** reward for improving recall—consistent with prioritizing sensitivity in pre-screening.
 
-Effect of β on Fβ score with fixed precision = 0.5: F₂ (recall-heavy) rises fastest with recall; F₁ is balanced; F₀.₅ is flattest.
+![Effect of β on Fβ score with fixed precision = 0.5: F₂ (recall-heavy) rises fastest with recall; F₁ is balanced; F₀.₅ is flattest.](assets/fbeta-vs-recall-graph.png)
 
 All three curves meet at **recall = 0.5, Fβ = 0.5** when precision is also 0.5, because precision and recall are equal there.
 
-#### 4.4.5 What validators store per day
+#### 4.4.7 What validators store per day
 
-For each eligible UID and day **E**, persist at least **Fβ**, and optionally **precision**, **recall**, and sample counts for audit. **Tier logic (§5) and ranking (§6)** use **Fβ** as the **primary metric** (daily value and its aggregate over lookback windows).
+For each eligible UID and day **E**, persist at least **Fβ**, and optionally **precision**, **recall**, batch-level TP/FP/FN counts, and per-condition breakdown for audit. **Tier logic (§5) and ranking (§6)** use **Fβ** as the **primary metric** (daily value and its aggregate over lookback windows).
 
-#### 4.4.6 Initial baseline model (reference)
+#### 4.4.8 Initial baseline model (reference)
 
 The subnet problem is naturally **vision + language**: images (e.g. chest imaging) plus prompts or structured text, with the model producing a **text** output (e.g. classification rationale or a discrete label wrapped in generation). So the **reference starting point** is an **image–text–to–text** (vision-language) stack, not a single-modal classifier—though miners may later submit other architectures if they expose a compatible inference API.
 
