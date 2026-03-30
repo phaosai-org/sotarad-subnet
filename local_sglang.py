@@ -29,7 +29,7 @@ import os
 import signal
 import sys
 import time
-from subprocess import Popen
+from subprocess import DEVNULL, Popen
 from typing import Optional
 
 import aiohttp
@@ -108,7 +108,7 @@ class SglangSubprocessServer:
         # New session so we can signal the whole process group on shutdown.
         self._proc = Popen(
             cmd,
-            stdin=Popen.DEVNULL,
+            stdin=DEVNULL,
             stdout=None,
             stderr=None,
             start_new_session=True,
