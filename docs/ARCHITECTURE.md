@@ -8,9 +8,13 @@ The system prompt that drives model inference is maintained as a standalone impo
 
 ## 1. Scope and design axis
 
-**What is measured:** for each chest X-ray study, the miner’s model is prompted to identify **which of the four target lung conditions are present**, producing a structured JSON array of findings (see §4.4 for the full evaluation protocol). The final scalar score per study is the **Fβ** computed from finding-level precision and recall against the ground-truth finding list. Models are evaluated on studies whose acquisition dates are **strictly after** each model’s on-chain submission time.
+**What is measured:** for each chest X-ray study, the miner’s model returns a **JSON array of finding objects** (see `prompts/system_prompt.py` and §4.4). **Ground truth** for whether the study should be treated as **screen-positive** is still derived from the dataset labels: any **`positive_finding`** with `condition` in the configured target set and `status == "active"` (see validator / dataset contract). Models are evaluated on studies whose acquisition dates are **strictly after** each model’s on-chain submission time.
 
-**Target conditions (v1):** Pneumonia, Tuberculosis, Bronchitis, Silicosis. These are the only conditions counted in scoring; findings outside this set are ignored.
+**Scoring version — V0 (flag-only):** validators **do not** compare individual finding fields for scoring. They only derive a **binary prediction per study**: **predicted positive** if the parsed JSON array is **non-empty** (the model **flagged** the image), **predicted negative** if the array is **`[]`**. Batch-level **TP / FP / FN / TN** and **Fβ** are computed from these study-level predictions vs. the ground-truth screen-positive label. **Unparseable** model output (no top-level JSON array) is treated like a failed inference: that sample is **skipped** for that miner (not counted toward the daily confusion matrix).
+
+**Future (V1+):** structured matching on `condition` / `location` / etc. may replace or augment flag-only scoring (see §4.4.3).
+
+**Target conditions (v1):** Pneumonia, Tuberculosis, Bronchitis, Silicosis. These are the only conditions that make a study **screen-positive** in ground truth; the model’s array contents are ignored for **V0** scoring except for empty vs non-empty.
 
 **Why Fβ and not plain accuracy:** pre-screening must **minimize missed disease** (high **recall / sensitivity**). Operational efficiency and human workload also depend on **precision** (fewer false alarms). **Recall is more important than precision**, but precision still matters. **F1** weights both equally; **Fβ** with **β greater than 1** tilts the score toward recall, matching “don’t miss positives” better than F1.
 
@@ -113,7 +117,7 @@ For each **eligible** UID on evaluation day **E** (respecting §2.3 and §4.3), 
 - The **patient demographics** block from the dataset record (`age_at_acquisition`, `sex`).
 - The **system prompt** defined in `prompts/system_prompt.py`, which instructs the model to output a JSON array of findings and specifies all controlled vocabulary.
 
-The model must respond with a **JSON array** of zero or more finding objects. Each object must contain exactly the fields `condition`, `status`, `laterality`, `location`, and `certainty` (see §4.4.2). A **`descriptors` field is not part of the expected output** (ground-truth exports may still carry descriptors for provenance; validators ignore them for model JSON validation). Responses that cannot be parsed as valid JSON are treated as an empty array for that study.
+The model must respond with a **JSON array** of zero or more finding objects (see `tests/test_model_request.py` and `prompts/response_parse.py` for the same parsing rules as the validator). Each object should follow §4.4.2. **V0 scoring** uses only **empty vs non-empty** array (§1). If the reply cannot be parsed as a top-level JSON array, the sample is **skipped** for that miner (not scored as negative).
 
 #### 4.4.2 Finding schema and controlled vocabulary
 
@@ -133,24 +137,24 @@ The model must **not** return **`descriptors`**. Fields `icd10`, `snomed_ct`, an
 
 The authoritative controlled vocabularies live in `prompts/system_prompt.py` (`TARGET_CONDITIONS`, `ALLOWED_STATUSES`, `LOCATION_PLURAL_BY_SINGULAR`, etc.) and are shared between the prompt and the validator scoring code.
 
-#### 4.4.3 Finding-level matching
+#### 4.4.3 Matching model output to labels
 
-Validators compare the model’s predicted findings against the ground-truth `positive_findings` array from the dataset API for that study. Matching is done **per condition**:
+**V0 (current):** after parsing the model reply to a JSON array `A`:
 
-- **True positive (TP):** a target condition appears in both the model output and the ground truth for that study (match on `condition` field; other fields may be used for partial credit schemes in future versions but are not required for a basic TP in v1).
-- **False negative (FN):** a target condition is in the ground truth but absent from the model output.
-- **False positive (FP):** a target condition is in the model output but absent from the ground truth.
+- **Predicted positive** iff `len(A) > 0` (model **flagged** the study).
+- **Predicted negative** iff `len(A) == 0`.
+- **Ground-truth positive** iff the dataset study has at least one `positive_finding` with `condition` in the configured target set and `status == "active"` (same rule as the validator’s label derivation).
 
-Conditions outside the four targets are ignored in both sets before matching. Multiple findings with the same `condition` within one study count as one entry in the match set (v1 simplification; later versions may score field-level accuracy within a matched condition).
+Per study: TP / FP / FN / TN are the usual confusion cells comparing **predicted** vs **ground-truth** screen-positive. **No use** is made of `condition`, `location`, etc. inside `A` for scoring in V0.
 
-Counts accumulate across **all studies** in the daily evaluation batch before computing Precision, Recall, and Fβ.
+**Future (V1+):** validators may instead (or additionally) compare structured findings to ground truth **per condition** (e.g. TP = matching target condition present in both model output and `positive_findings`), with optional field-level partial credit.
 
 #### 4.4.4 Precision, recall, and confusion counts
 
-From the batch-level aggregate TP, FP, FN counts:
+From the batch-level aggregate TP, FP, FN counts (**V0:** study-level flag vs ground-truth screen-positive):
 
-- **Precision** is the fraction of predicted conditions that are correct: **TP / (TP + FP)** (of all conditions the model flagged, how many were truly present).
-- **Recall** (sensitivity) is the fraction of true conditions the model caught: **TP / (TP + FN)** (of all conditions actually present, how many the model flagged).
+- **Precision** is **TP / (TP + FP)** — of all studies the model **flagged** (non-empty array), how many were truly screen-positive.
+- **Recall** (sensitivity) is **TP / (TP + FN)** — of all truly screen-positive studies, how many the model **flagged**.
 
 Implementation must define behavior when denominators are zero (e.g. **TP + FP = 0** or **TP + FN = 0**)—skip the day, assign a sentinel score, or use a documented fallback—so ranking stays well-defined.
 
@@ -269,7 +273,7 @@ The **headline “top model”** for the largest tier (default 95%) is the singl
 | Scoring                 | **β** for **Fβ**; definition of **positive vs negative** class; edge-case rules for empty denominators                  |
 | Tier table              | For each tier: percentile or rank rule, lookback days, emission percentage, aggregate over daily **Fβ** (default: mean) |
 | Duplicate policy        | How “same model” is detected; **first on-chain submitter eligible, all later duplicates ineligible**; deterministic tie-break if commit times collide |
-| Chutes / request schema | Standard inference payload and **binary (or binarized) label mapping** for precision / recall / **Fβ**                  |
+| Chutes / request schema | OpenAI-compatible vision chat: `build_chutes_messages` + `prompts/system_prompt.py`; parse JSON array (`prompts/response_parse.py`); **V0:** non-empty = flagged |
 
 
 ---
@@ -283,4 +287,4 @@ The **headline “top model”** for the largest tier (default 95%) is the singl
 
 ## 9. Relation to base `validator.py`
 
-The existing `validator.py` connects to subtensor, syncs metagraph, and sets weights on a fixed tempo. The architecture above assumes this loop becomes the shell around: **commit parsing → duplicate filter (earliest submitter only per duplicate group) → daily evaluation job (inference → precision / recall → Fβ) → tier aggregation → `set_weights`**.
+The `validator.py` loop: **commit parsing → duplicate filter (earliest submitter only per duplicate group) → daily evaluation (Chutes vision + JSON findings parse → V0 flag vs ground truth → TP/FP/FN/TN → Fβ) → tier aggregation → `set_weights`**. Request shape matches `tests/test_model_request.py`.

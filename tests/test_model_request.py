@@ -19,74 +19,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from prompts.system_prompt import SYSTEM_PROMPT, build_user_message
+from prompts.response_parse import parse_findings_json_array
+from prompts.system_prompt import build_chutes_messages
 
 from model_utils import DEFAULT_HOST, DEFAULT_MODEL, DEFAULT_PORT, image_to_data_url, post_json
-
-
-def parse_reply_findings_array(content: str) -> list | None:
-    """
-    Prefer a message that is only JSON. If the model prepends chain-of-thought,
-    accept the first top-level JSON array that consumes the rest of the string
-    (aside from trailing whitespace).
-    """
-    text = content.strip()
-    try:
-        val = json.loads(text)
-        if isinstance(val, list):
-            return val
-    except json.JSONDecodeError:
-        pass
-
-    dec = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch != "[":
-            continue
-        try:
-            val, end = dec.raw_decode(text, i)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(val, list):
-            continue
-        if text[end:].strip():
-            continue
-        return val
-    return None
-
-
-def _build_messages(
-    image_content: dict,
-    patient_demographics: dict,
-    *,
-    use_system_role: bool,
-) -> list[dict]:
-    """
-    Many local /v1/chat/completions stacks return 400 if a `system` message is
-    sent alongside vision user content. Default is a single `user` turn with
-    system instructions prepended to the text (same semantics, wider support).
-    """
-    user_text = build_user_message(patient_demographics)
-    if use_system_role:
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    image_content,
-                    {"type": "text", "text": user_text},
-                ],
-            },
-        ]
-    combined_text = f"{SYSTEM_PROMPT.rstrip()}\n\n{user_text}"
-    return [
-        {
-            "role": "user",
-            "content": [
-                image_content,
-                {"type": "text", "text": combined_text},
-            ],
-        }
-    ]
 
 
 def main() -> None:
@@ -132,17 +68,16 @@ def main() -> None:
         if not image_path.exists():
             print(f"ERROR: file not found: {image_path}", file=sys.stderr)
             sys.exit(1)
-        image_content = {
-            "type": "image_url",
-            "image_url": {"url": image_to_data_url(image_path)},
-        }
+        image_url = image_to_data_url(image_path)
     else:
-        image_content = {"type": "image_url", "image_url": {"url": args.image_url}}
+        image_url = args.image_url
 
     payload = {
         "model": args.model,
-        "messages": _build_messages(
-            image_content, demographics, use_system_role=args.system_role
+        "messages": build_chutes_messages(
+            image_url,
+            demographics,
+            merge_system_into_user=not args.system_role,
         ),
         "max_tokens": 1024,
         "temperature": 0.0,
@@ -155,7 +90,7 @@ def main() -> None:
         sys.exit(1)
 
     content = response["choices"][0]["message"]["content"]
-    parsed = parse_reply_findings_array(content)
+    parsed = parse_findings_json_array(content)
     if parsed is None:
         print(
             "ERROR: could not parse a JSON array from the reply (expected only [], "

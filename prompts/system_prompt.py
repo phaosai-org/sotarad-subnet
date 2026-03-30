@@ -1,9 +1,9 @@
 """
 System prompt and user message builder for lung-finding extraction.
 
-Import this module from validator.py and test scripts:
+Import from validator.py and test scripts:
 
-    from prompts.system_prompt import SYSTEM_PROMPT, build_user_message
+    from prompts.system_prompt import SYSTEM_PROMPT, build_user_message, build_chutes_messages
 """
 
 # ---------------------------------------------------------------------------
@@ -107,3 +107,41 @@ def build_user_message(patient_demographics: dict) -> str:
     sex = {"M": "male", "F": "female"}.get(sex_raw, sex_raw)
 
     return f"Patient: {age}-year-old {sex}."
+
+
+def build_chutes_messages(
+    image_url: str,
+    patient_demographics: dict,
+    *,
+    merge_system_into_user: bool = True,
+) -> list[dict]:
+    """
+    OpenAI-compatible chat messages for vision + system prompt + demographics.
+
+    Many Chutes / local stacks return 400 if a `system` message is sent
+    alongside vision user content. Default merges SYSTEM_PROMPT into the user
+    text (same semantics as tests/test_model_request.py).
+    """
+    image_content = {"type": "image_url", "image_url": {"url": image_url}}
+    user_text = build_user_message(patient_demographics)
+    if merge_system_into_user:
+        combined_text = f"{SYSTEM_PROMPT.rstrip()}\n\n{user_text}"
+        return [
+            {
+                "role": "user",
+                "content": [
+                    image_content,
+                    {"type": "text", "text": combined_text},
+                ],
+            }
+        ]
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                image_content,
+                {"type": "text", "text": user_text},
+            ],
+        },
+    ]

@@ -4,123 +4,37 @@ SotaRad Subnet Validator
 
 What is measured
 ----------------
-Each miner's radiology pre-screening model is scored with **Fβ** (default β = 2,
-emphasising recall) on **public** evaluation samples whose timestamps are strictly
-after the model's on-chain submission time plus a configurable delay.  This rewards
-generalisation: models must perform well on cases they could not have seen during
-training.
+Each miner's model is scored with **Fβ** (default β = 2) on **public** evaluation
+studies whose acquisition timestamps are strictly after the model's on-chain
+submission time plus a configurable delay.
 
 Miner interface (Chutes / OpenAI-compatible vision endpoint)
--------------------------------------------------------------
-Miners deploy a vision-language model to Chutes and commit the following JSON to
-the Bittensor chain (rate-limited to ~1 per 100 blocks):
+----------------------------------------------------------
+Miners deploy a vision-language model to Chutes and commit JSON to chain
+(`repo`, `revision`, `chute_id`, optional `params`). Validators call:
 
-    {
-        "repo":     "hf-username/model-name",   # Hugging Face repo ID
-        "revision": "abc1234...",               # git commit SHA (full or short)
-        "chute_id": "chutes-deployment-uuid",   # Chutes deployment identifier
-        "params":   2000000000                  # parameter count (optional, tie-break)
-    }
+    POST {CHUTES_LLM_URL}/chat/completions
 
-Validators route binary-classification inference requests to each miner's Chutes
-deployment via the OpenAI-compatible chat-completions endpoint:
+using `prompts/system_prompt.py` (`SYSTEM_PROMPT`, `build_user_message`,
+`build_chutes_messages`) — same shape as `tests/test_model_request.py`.
 
-    POST https://llm.chutes.ai/v1/chat/completions
-    {
-        "model": "<chute_id>",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": "<image_url>"}},
-                {"type": "text",      "text": "<INFERENCE_PROMPT>"}
-            ]
-        }],
-        "max_tokens": 20,
-        "temperature": 0.0
-    }
+The model must return a **top-level JSON array** of finding objects (may be `[]`).
 
-    Expected response text: "positive" | "negative"
-    ("positive" = screen positive / disease flagged; anything else = negative)
+Scoring V0 — flag only (see docs/ARCHITECTURE.md §4.4.3)
+-------------------------------------------------------
+- **Predicted positive** iff the parsed array has **len > 0**.
+- **Predicted negative** iff the parsed array is **[]**.
+- **Unparseable** reply → sample **skipped** for that miner (like a transport error).
+- **Ground truth positive** iff any `positive_finding` has
+  `condition ∈ TARGET_CONDITIONS` and `status == "active"`.
 
-Scoring (per evaluation day)
-----------------------------
-A confusion matrix is accumulated over the sample batch:
-    TP: predicted positive, actually positive
-    FP: predicted positive, actually negative
-    FN: predicted negative, actually positive  ← critical for screening
-    TN: predicted negative, actually negative
+TP / FP / FN / TN and Fβ are computed from these study-level predictions.
 
-    Precision = TP / (TP + FP)
-    Recall    = TP / (TP + FN)
-    Fβ        = (1 + β²) × P × R / (β² × P + R)    [β default = 2]
+Default **TARGET_CONDITIONS** match `prompts/system_prompt.TARGET_CONDITIONS`
+(four lung conditions). Override with env `TARGET_CONDITIONS` or `--target-conditions`.
 
-Zero-denominator cases return 0.0 and are documented.
-
-Tier incentives (all values configurable)
-------------------------------------------
-    Tier A (95 %):  top-1 miner by mean Fβ over last 5 completed days
-    Tier B  (2 %):  top 10 % by mean Fβ over last 4 days
-    Tier C (1.5 %): top 20 % over last 3 days
-    Tier D  (1 %):  top 30 % over last 2 days
-    Tier E (0.5 %): top 40 % over last 1 day
-
-A single UID can qualify for multiple tiers; emissions are additive before
-normalisation into on-chain weights.  Tiers with no qualifying miners are skipped.
-
-Tie-breaking (§6 of ARCHITECTURE.md)
---------------------------------------
-Within a tier: higher Fβ > higher recall > higher precision > fewer params > earlier
-on-chain commit block.
-
-Duplicate policy
-----------------
-Two commits are duplicates when they share the same (repo, revision) pair.  Only the
-earliest on-chain submitter per group is eligible for evaluation and incentives.
-Later duplicates are excluded until they commit a distinct model version.  Same-block
-ties are broken by lower UID.
-
-Dataset API contract (configurable base URL)
---------------------------------------------
-    GET {DATASET_BASE_URL}/studies
-        ?after=<YYYY-MM-DD>&before=<YYYY-MM-DD>&limit=<int>
-
-    Response schema (matches data/results.json):
-    {
-        "api_version": "1.0",
-        "cohort_id": str,
-        "exported_at": str,        # ISO-8601 datetime
-        "studies": [
-            {
-                "study_id":          str,          # e.g. "ms-00001"
-                "image_file":        str,          # filename OR full URL
-                "acquisition_date":  str,          # "YYYY-MM-DD"
-                "report_findings": {
-                    "positive_findings": [
-                        {
-                            "condition": str,   # e.g. "Tuberculosis", "Silicosis"
-                            "status":    str,   # "active" | "previous" | "chronic" ...
-                            ...
-                        }
-                    ]
-                }
-            }
-        ]
-    }
-
-Label derivation:
-    label = 1 (screen positive) if ANY positive_finding has:
-        condition ∈ TARGET_CONDITIONS  AND  status == "active"
-    label = 0 otherwise.
-
-    Default TARGET_CONDITIONS: Tuberculosis, Silicosis
-    Override via env var TARGET_CONDITIONS=Tuberculosis,Silicosis,...
-
-Image URL construction:
-    If image_file is already a full URL (starts with http) → used as-is.
-    Otherwise → IMAGE_BASE_URL + "/" + image_file.
-    Set IMAGE_BASE_URL to the dataset server's image-serving endpoint.
-
-Reference baseline model: 0llheaven/Llama-3.2-11B-Vision-Radiology-mini
+Tier incentives, duplicate policy, and dataset API contract are unchanged; see
+ARCHITECTURE.md and inline code.
 """
 
 from __future__ import annotations
@@ -129,11 +43,12 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import sqlite3
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -141,6 +56,13 @@ import aiohttp
 import bittensor as bt
 import click
 from bittensor_wallet import Wallet
+
+from local_sglang import SglangSubprocessServer
+from prompts.response_parse import parse_findings_json_array
+from prompts.system_prompt import (
+    TARGET_CONDITIONS as PROMPT_TARGET_CONDITIONS,
+    build_chutes_messages,
+)
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -154,19 +76,12 @@ logger = logging.getLogger(__name__)
 
 
 # ── Target condition config ───────────────────────────────────────────────────
-# Conditions (as they appear in report_findings[].condition) that count as a
-# "screen positive" when their status is "active".  Comma-separated env var.
-_DEFAULT_TARGET_CONDITIONS = {"Tuberculosis", "Silicosis"}
-
+# Conditions (as in report_findings[].condition) that count as screen-positive
+# when status == "active". Default matches prompts/system_prompt.py.
 def _parse_target_conditions(raw: str) -> frozenset[str]:
-    """Parse TARGET_CONDITIONS env var into a frozenset of condition names."""
     if not raw.strip():
-        return frozenset(_DEFAULT_TARGET_CONDITIONS)
+        return frozenset(PROMPT_TARGET_CONDITIONS)
     return frozenset(c.strip() for c in raw.split(",") if c.strip())
-
-TARGET_CONDITIONS: frozenset[str] = _parse_target_conditions(
-    os.getenv("TARGET_CONDITIONS", "")
-)
 
 
 # ── Tier configuration ────────────────────────────────────────────────────────
@@ -213,8 +128,9 @@ class MinerCommit:
 class EvalSample:
     sample_id: str
     image_url: str
-    label: int        # 1 = positive (disease present), 0 = negative
+    label: int        # 1 = screen-positive (ground truth), 0 = negative
     timestamp: float  # unix timestamp of this sample
+    patient_demographics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -352,11 +268,17 @@ def fetch_all_commits(
     metagraph: bt.Metagraph,
     netuid: int,
     current_block: int,
+    *,
+    allow_local: bool = False,
 ) -> list[MinerCommit]:
     """
     Read every miner's on-chain commitment, parse the JSON payload, and return
     a list of MinerCommit objects.  UIDs with missing or malformed commitments
     are silently skipped.
+
+    If ``allow_local`` is False, ``chute_id`` must be non-empty (Chutes-only).
+    If True, empty ``chute_id`` is allowed and the validator may load the HF
+    ``repo`` + ``revision`` via local SGLang instead.
     """
     try:
         raw: dict = subtensor.get_all_commitments(netuid)
@@ -393,14 +315,18 @@ def fetch_all_commits(
             payload = json.loads(data_str)
             repo     = str(payload["repo"]).strip()
             revision = str(payload["revision"]).strip()
-            chute_id = str(payload["chute_id"]).strip()
+            chute_id = str(payload.get("chute_id") or "").strip()
             params   = int(payload.get("params", 0))
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
             logger.debug(f"UID {uid}: invalid commitment JSON – {exc}")
             continue
 
-        if not repo or not revision or not chute_id:
-            logger.debug(f"UID {uid}: commitment missing required fields")
+        if not repo or not revision:
+            logger.debug(f"UID {uid}: commitment missing repo or revision")
+            continue
+
+        if not chute_id and not allow_local:
+            logger.debug(f"UID {uid}: missing chute_id (use --allow-local for HF-only commits)")
             continue
 
         try:
@@ -564,14 +490,18 @@ async def fetch_eval_samples(
             positive_findings = study.get("report_findings", {}).get("positive_findings", [])
 
             image_url = _resolve_image_url(image_field, image_base_url)
-            label     = _is_screen_positive(positive_findings, target_conditions)
-            timestamp = _acquisition_date_to_ts(acq_date)
+            label       = _is_screen_positive(positive_findings, target_conditions)
+            timestamp   = _acquisition_date_to_ts(acq_date)
+            demographics = study.get("patient_demographics") or {}
+            if not isinstance(demographics, dict):
+                demographics = {}
 
             samples.append(EvalSample(
                 sample_id=study_id,
                 image_url=image_url,
                 label=label,
                 timestamp=timestamp,
+                patient_demographics=demographics,
             ))
         except (KeyError, ValueError, TypeError) as exc:
             logger.debug(f"Skipping malformed study entry: {exc}")
@@ -585,52 +515,50 @@ async def fetch_eval_samples(
     return samples
 
 
-# ── Chutes inference client ───────────────────────────────────────────────────
-
-_INFERENCE_PROMPT: str = os.getenv(
-    "INFERENCE_PROMPT",
-    (
-        "You are a chest X-ray pre-screening AI. Examine this radiograph and determine "
-        "whether it shows signs of active tuberculosis (TB) or active silicosis requiring "
-        "clinical attention.\n\n"
-        "Reply with exactly one word:\n"
-        "positive — if active TB or active silicosis is present\n"
-        "negative — if neither condition is active\n\n"
-        "Answer:"
-    ),
-)
+# ── Vision inference (Chutes or local SGLang OpenAI-compatible) ─────────────
 
 
-async def query_chute(
+def _chat_completions_url(base_url: str) -> str:
+    """Chutes base often ends with ``/v1``; SGLang root is host:port only."""
+    b = base_url.rstrip("/")
+    if b.endswith("/v1"):
+        return f"{b}/chat/completions"
+    return f"{b}/v1/chat/completions"
+
+
+async def query_vision_completion(
     session: aiohttp.ClientSession,
-    chutes_llm_url: str,
-    chutes_api_key: str,
-    chute_id: str,
+    base_url: str,
+    bearer_token: str,
+    model: str,
     image_url: str,
+    patient_demographics: dict,
+    *,
+    merge_system_into_user: bool,
+    max_tokens: int,
     timeout_s: int = 60,
+    log_label: str = "",
 ) -> Optional[int]:
     """
-    Send a vision-language inference request to a miner's Chutes deployment.
+    POST /v1/chat/completions; parse JSON findings array (same rules as tests).
 
-    Returns:
-        1  – model predicted positive (disease present)
-        0  – model predicted negative
-        None – inference failed (timeout, network error, invalid response)
+    V0 scoring: 1 if len(parsed array) > 0, 0 if []. None if HTTP/parse failure.
+    ``bearer_token`` may be empty for local servers without auth.
     """
     payload = {
-        "model": chute_id,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": image_url}},
-                {"type": "text",      "text": _INFERENCE_PROMPT},
-            ],
-        }],
-        "max_tokens": 20,
+        "model": model,
+        "messages": build_chutes_messages(
+            image_url,
+            patient_demographics,
+            merge_system_into_user=merge_system_into_user,
+        ),
+        "max_tokens": max_tokens,
         "temperature": 0.0,
     }
-    url     = f"{chutes_llm_url.rstrip('/')}/chat/completions"
-    headers = {"Authorization": f"Bearer {chutes_api_key}"}
+    url     = _chat_completions_url(base_url)
+    headers: dict[str, str] = {}
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
 
     try:
         async with session.post(
@@ -639,11 +567,45 @@ async def query_chute(
         ) as resp:
             resp.raise_for_status()
             result = await resp.json()
-        content: str = result["choices"][0]["message"]["content"]
-        return 1 if "positive" in content.lower() else 0
+        content = result["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            logger.debug("%s: non-string message content", log_label or model)
+            return None
+        findings = parse_findings_json_array(content)
+        if findings is None:
+            logger.debug("%s: could not parse JSON array from reply", log_label or model)
+            return None
+        return 1 if len(findings) > 0 else 0
     except Exception as exc:
-        logger.debug(f"Chute {chute_id[:16]}: inference error – {exc}")
+        logger.debug("%s: inference error – %s", log_label or model, exc)
         return None
+
+
+async def query_chute(
+    session: aiohttp.ClientSession,
+    chutes_llm_url: str,
+    chutes_api_key: str,
+    chute_id: str,
+    image_url: str,
+    patient_demographics: dict,
+    *,
+    merge_system_into_user: bool,
+    max_tokens: int,
+    timeout_s: int = 60,
+) -> Optional[int]:
+    """Chutes-hosted model (requires API key)."""
+    return await query_vision_completion(
+        session,
+        chutes_llm_url,
+        chutes_api_key,
+        chute_id,
+        image_url,
+        patient_demographics,
+        merge_system_into_user=merge_system_into_user,
+        max_tokens=max_tokens,
+        timeout_s=timeout_s,
+        log_label=f"Chute {chute_id[:16]}",
+    )
 
 
 # ── Fβ scoring ────────────────────────────────────────────────────────────────
@@ -676,21 +638,75 @@ async def evaluate_miner(
     chutes_llm_url: str,
     chutes_api_key: str,
     chutes_timeout: int,
+    chutes_max_tokens: int,
+    chutes_merge_system_into_user: bool,
     beta: float,
     eval_date: str,
+    *,
+    allow_local: bool,
+    local_sglang_host: str,
+    local_sglang_port: int,
+    sglang_extra_argv: list[str],
+    sglang_startup_timeout: float,
 ) -> Optional[EvalResult]:
     """
-    Run inference for one miner across the sample batch and compute Fβ.
-    Returns None if all inference calls failed.
+    Run inference for one miner across the sample batch and compute Fβ (V0 flag-only).
+    Returns None if all inference calls failed or were unparseable.
+
+    With a non-empty ``chute_id``, calls Chutes. Otherwise (HF-only commit) starts
+    a local SGLang server when ``allow_local`` is True.
     """
-    tasks = [
-        query_chute(
-            session, chutes_llm_url, chutes_api_key,
-            commit.chute_id, s.image_url, chutes_timeout,
+    use_chutes = bool(commit.chute_id.strip())
+    if not use_chutes:
+        if not allow_local:
+            logger.warning("UID %s: empty chute_id but allow_local is off", commit.uid)
+            return None
+        server = SglangSubprocessServer(
+            commit.repo,
+            commit.revision,
+            local_sglang_host,
+            local_sglang_port,
+            extra_argv=sglang_extra_argv,
+            startup_timeout_s=sglang_startup_timeout,
         )
-        for s in samples
-    ]
-    predictions = await asyncio.gather(*tasks)
+        await asyncio.to_thread(server.start)
+        try:
+            if not await server.wait_until_ready(session):
+                return None
+            tasks = [
+                query_vision_completion(
+                    session,
+                    server.base_url,
+                    "",
+                    commit.repo,
+                    s.image_url,
+                    s.patient_demographics,
+                    merge_system_into_user=chutes_merge_system_into_user,
+                    max_tokens=chutes_max_tokens,
+                    timeout_s=chutes_timeout,
+                    log_label=f"local {commit.repo}",
+                )
+                for s in samples
+            ]
+            predictions = await asyncio.gather(*tasks)
+        finally:
+            await asyncio.to_thread(server.stop)
+    else:
+        tasks = [
+            query_chute(
+                session,
+                chutes_llm_url,
+                chutes_api_key,
+                commit.chute_id,
+                s.image_url,
+                s.patient_demographics,
+                merge_system_into_user=chutes_merge_system_into_user,
+                max_tokens=chutes_max_tokens,
+                timeout_s=chutes_timeout,
+            )
+            for s in samples
+        ]
+        predictions = await asyncio.gather(*tasks)
 
     tp = fp = fn = tn = evaluated = 0
     for sample, pred in zip(samples, predictions):
@@ -707,8 +723,9 @@ async def evaluate_miner(
         else:
             tn += 1
 
+    id_short = (commit.chute_id.strip() or f"local:{commit.repo}")[:32]
     if evaluated == 0:
-        logger.warning(f"UID {commit.uid} ({commit.chute_id[:16]}): all inference calls failed")
+        logger.warning("UID %s (%s): all inference calls failed", commit.uid, id_short)
         return None
 
     precision, recall, fb = compute_metrics(tp, fp, fn, beta)
@@ -717,6 +734,7 @@ async def evaluate_miner(
         f"Fβ={fb:.4f}  P={precision:.4f}  R={recall:.4f}  "
         f"TP={tp}  FP={fp}  FN={fn}  TN={tn}  n={evaluated}"
     )
+    stored_chute_id = commit.chute_id.strip() or f"local:{commit.repo}"
     return EvalResult(
         uid=commit.uid,
         eval_date=eval_date,
@@ -725,7 +743,7 @@ async def evaluate_miner(
         fb_score=fb,
         precision_score=precision,
         recall_score=recall,
-        chute_id=commit.chute_id,
+        chute_id=stored_chute_id,
         revision=commit.revision,
     )
 
@@ -743,10 +761,18 @@ async def run_daily_evaluation(
     chutes_llm_url: str,
     chutes_api_key: str,
     chutes_timeout: int,
+    chutes_max_tokens: int,
+    chutes_merge_system_into_user: bool,
     chutes_max_concurrent: int,
     eval_samples_per_day: int,
     eval_delay_days: int,
     beta: float,
+    *,
+    allow_local: bool,
+    local_sglang_host: str,
+    local_sglang_port: int,
+    sglang_extra_argv: list[str],
+    sglang_startup_timeout: float,
 ) -> list[MinerCommit]:
     """
     One complete daily evaluation pass.  Returns the list of eligible commits
@@ -756,7 +782,14 @@ async def run_daily_evaluation(
     logger.info(f"=== Daily evaluation starting for {today} ===")
 
     # 1. Discover all miner commitments
-    commits  = await asyncio.to_thread(fetch_all_commits, subtensor, metagraph, netuid, current_block)
+    commits = await asyncio.to_thread(
+        fetch_all_commits,
+        subtensor,
+        metagraph,
+        netuid,
+        current_block,
+        allow_local=allow_local,
+    )
 
     # 2. Dedup: only the earliest submitter per (repo, revision) is eligible
     eligible = deduplicate_commits(commits)
@@ -791,24 +824,57 @@ async def run_daily_evaluation(
 
         logger.info(f"Fetched {len(samples)} evaluation samples from dataset API")
 
-        # 5. Evaluate each eligible miner (bounded concurrency via semaphore)
+        # 5. Evaluate each eligible miner (bounded concurrency via semaphore;
+        #    local SGLang is serialized — one subprocess / GPU at a time)
         sem = asyncio.Semaphore(chutes_max_concurrent)
+        local_slot = asyncio.Semaphore(1)
 
         async def _eval_one(commit: MinerCommit) -> Optional[EvalResult]:
-            async with sem:
-                # Only use samples whose timestamp is strictly after this miner's
-                # training cutoff (commit_ts + delay), enforcing temporal integrity.
-                miner_cutoff = commit.commit_ts + eval_delay_days * 86_400
-                miner_samples = [s for s in samples if s.timestamp > miner_cutoff]
-                if not miner_samples:
-                    logger.debug(
-                        f"UID {commit.uid}: no samples pass temporal filter "
-                        f"(need ts > {miner_cutoff:.0f})"
+            miner_cutoff = commit.commit_ts + eval_delay_days * 86_400
+            miner_samples = [s for s in samples if s.timestamp > miner_cutoff]
+            if not miner_samples:
+                logger.debug(
+                    f"UID {commit.uid}: no samples pass temporal filter "
+                    f"(need ts > {miner_cutoff:.0f})"
+                )
+                return None
+            is_local_hf = allow_local and not commit.chute_id.strip()
+            if is_local_hf:
+                async with local_slot:
+                    return await evaluate_miner(
+                        session,
+                        commit,
+                        miner_samples,
+                        chutes_llm_url,
+                        chutes_api_key,
+                        chutes_timeout,
+                        chutes_max_tokens,
+                        chutes_merge_system_into_user,
+                        beta,
+                        today,
+                        allow_local=allow_local,
+                        local_sglang_host=local_sglang_host,
+                        local_sglang_port=local_sglang_port,
+                        sglang_extra_argv=sglang_extra_argv,
+                        sglang_startup_timeout=sglang_startup_timeout,
                     )
-                    return None
+            async with sem:
                 return await evaluate_miner(
-                    session, commit, miner_samples,
-                    chutes_llm_url, chutes_api_key, chutes_timeout, beta, today,
+                    session,
+                    commit,
+                    miner_samples,
+                    chutes_llm_url,
+                    chutes_api_key,
+                    chutes_timeout,
+                    chutes_max_tokens,
+                    chutes_merge_system_into_user,
+                    beta,
+                    today,
+                    allow_local=allow_local,
+                    local_sglang_host=local_sglang_host,
+                    local_sglang_port=local_sglang_port,
+                    sglang_extra_argv=sglang_extra_argv,
+                    sglang_startup_timeout=sglang_startup_timeout,
                 )
 
         results = await asyncio.gather(*[_eval_one(c) for c in eligible])
@@ -987,12 +1053,20 @@ async def validator_loop(
     chutes_llm_url: str,
     chutes_api_key: str,
     chutes_timeout: int,
+    chutes_max_tokens: int,
+    chutes_merge_system_into_user: bool,
     chutes_max_concurrent: int,
     eval_samples_per_day: int,
     eval_delay_days: int,
     beta: float,
     tiers: list[TierConfig],
     heartbeat_timeout: int,
+    *,
+    allow_local: bool,
+    local_sglang_host: str,
+    local_sglang_port: int,
+    sglang_extra_argv: list[str],
+    sglang_startup_timeout: float,
 ) -> None:
     # ── Heartbeat thread ──────────────────────────────────────────────────────
     last_heartbeat: list[float] = [time.time()]
@@ -1034,7 +1108,14 @@ async def validator_loop(
 
         # Pre-populate eligible_commits from chain so weight-setting works immediately
         current_block = await asyncio.to_thread(subtensor.get_current_block)
-        commits       = await asyncio.to_thread(fetch_all_commits, subtensor, metagraph, netuid, current_block)
+        commits = await asyncio.to_thread(
+            fetch_all_commits,
+            subtensor,
+            metagraph,
+            netuid,
+            current_block,
+            allow_local=allow_local,
+        )
         eligible_commits = filter_eligible(deduplicate_commits(commits), eval_delay_days)
 
         # ── Main loop ─────────────────────────────────────────────────────────
@@ -1062,10 +1143,17 @@ async def validator_loop(
                         chutes_llm_url=chutes_llm_url,
                         chutes_api_key=chutes_api_key,
                         chutes_timeout=chutes_timeout,
+                        chutes_max_tokens=chutes_max_tokens,
+                        chutes_merge_system_into_user=chutes_merge_system_into_user,
                         chutes_max_concurrent=chutes_max_concurrent,
                         eval_samples_per_day=eval_samples_per_day,
                         eval_delay_days=eval_delay_days,
                         beta=beta,
+                        allow_local=allow_local,
+                        local_sglang_host=local_sglang_host,
+                        local_sglang_port=local_sglang_port,
+                        sglang_extra_argv=sglang_extra_argv,
+                        sglang_startup_timeout=sglang_startup_timeout,
                     )
 
                 # ── Weight-setting trigger ────────────────────────────────────
@@ -1130,13 +1218,21 @@ async def validator_loop(
 @click.option("--image-base-url",       default=lambda: os.getenv("IMAGE_BASE_URL", ""),
               help="Base URL prepended to image_file filenames (e.g. https://data.sotarad.ai/images)")
 @click.option("--target-conditions",    default=lambda: os.getenv("TARGET_CONDITIONS", ""),
-              help="Comma-separated conditions that count as screen-positive (default: Tuberculosis,Silicosis)")
+              help="Comma-separated conditions for ground-truth screen-positive (default: four targets from prompts/system_prompt.py)")
 @click.option("--chutes-api-key",       default=lambda: os.getenv("CHUTES_API_KEY", ""),
               help="Chutes API key (cpk_...)")
 @click.option("--chutes-llm-url",       default=lambda: os.getenv("CHUTES_LLM_URL", "https://llm.chutes.ai/v1"),
               help="Chutes OpenAI-compatible base URL")
 @click.option("--chutes-timeout",       type=int, default=lambda: int(os.getenv("CHUTES_TIMEOUT", "60")),
               help="Per-inference request timeout (seconds)")
+@click.option("--chutes-max-tokens",    type=int, default=lambda: int(os.getenv("CHUTES_MAX_TOKENS", "1024")),
+              help="max_tokens for JSON findings output (vision chat completion)")
+@click.option(
+    "--chutes-separate-system",
+    is_flag=True,
+    default=False,
+    help="Send SYSTEM_PROMPT as role=system (default: merge into user text for API compatibility)",
+)
 @click.option("--chutes-max-concurrent",type=int, default=lambda: int(os.getenv("CHUTES_MAX_CONCURRENT", "4")),
               help="Max parallel miner evaluations")
 @click.option("--eval-samples-per-day", type=int, default=lambda: int(os.getenv("EVAL_SAMPLES_PER_DAY", "100")),
@@ -1147,6 +1243,34 @@ async def validator_loop(
               help="β parameter for Fβ scoring (>1 weights recall more than precision)")
 @click.option("--heartbeat-timeout",    type=int, default=lambda: int(os.getenv("HEARTBEAT_TIMEOUT", "600")),
               help="Seconds without loop heartbeat before auto-restart")
+@click.option(
+    "--allow-local",
+    is_flag=True,
+    default=False,
+    help="If set, miners without chute_id are evaluated via HF repo+revision on local SGLang",
+)
+@click.option(
+    "--local-sglang-host",
+    default=lambda: os.getenv("LOCAL_SGLANG_HOST", "127.0.0.1"),
+    help="Bind address for subprocess sglang.launch_server",
+)
+@click.option(
+    "--local-sglang-port",
+    type=int,
+    default=lambda: int(os.getenv("LOCAL_SGLANG_PORT", "30000")),
+    help="Port for local SGLang (one server at a time when evaluating HF-only miners)",
+)
+@click.option(
+    "--sglang-startup-timeout",
+    type=float,
+    default=lambda: float(os.getenv("SGLANG_STARTUP_TIMEOUT", "600")),
+    help="Seconds to wait for local SGLang HTTP readiness",
+)
+@click.option(
+    "--sglang-extra-args",
+    default=lambda: os.getenv("SGLANG_EXTRA_ARGS", ""),
+    help="Extra arguments for sglang.launch_server (shell-quoted, e.g. \"--tp 1 --mem-fraction-static 0.9\")",
+)
 @click.option("--mock",                 is_flag=True, default=lambda: os.getenv("MOCK", "").lower() == "true",
               help="Use local mock servers: dataset API on :8100, Chutes on :8200 (see mock/)")
 def main(
@@ -1163,15 +1287,23 @@ def main(
     chutes_api_key: str,
     chutes_llm_url: str,
     chutes_timeout: int,
+    chutes_max_tokens: int,
+    chutes_separate_system: bool,
     chutes_max_concurrent: int,
     eval_samples_per_day: int,
     eval_delay_days: int,
     fbeta_beta: float,
     heartbeat_timeout: int,
+    allow_local: bool,
+    local_sglang_host: str,
+    local_sglang_port: int,
+    sglang_startup_timeout: float,
+    sglang_extra_args: str,
     mock: bool,
 ) -> None:
     """SotaRad subnet validator: scores radiology pre-screening models via Fβ."""
     logging.getLogger().setLevel(getattr(logging, log_level.upper()))
+    chutes_merge_system_into_user = not chutes_separate_system
 
     if mock:
         dataset_base_url = dataset_base_url or "http://localhost:8100"
@@ -1182,10 +1314,12 @@ def main(
         logger.info("Mock mode: dataset=:8100  chutes=:8200  eval_delay_days=0")
 
     parsed_conditions = _parse_target_conditions(target_conditions)
+    sglang_argv = shlex.split(sglang_extra_args) if sglang_extra_args.strip() else []
     logger.info(
         f"Starting SotaRad validator | network={network} netuid={netuid} "
         f"β={fbeta_beta} eval_delay={eval_delay_days}d samples/day={eval_samples_per_day} "
-        f"target_conditions={sorted(parsed_conditions)}"
+        f"chutes_max_tokens={chutes_max_tokens} merge_system_into_user={chutes_merge_system_into_user} "
+        f"allow_local={allow_local} target_conditions={sorted(parsed_conditions)}"
     )
     asyncio.run(validator_loop(
         network=network,
@@ -1200,12 +1334,19 @@ def main(
         chutes_llm_url=chutes_llm_url,
         chutes_api_key=chutes_api_key,
         chutes_timeout=chutes_timeout,
+        chutes_max_tokens=chutes_max_tokens,
+        chutes_merge_system_into_user=chutes_merge_system_into_user,
         chutes_max_concurrent=chutes_max_concurrent,
         eval_samples_per_day=eval_samples_per_day,
         eval_delay_days=eval_delay_days,
         beta=fbeta_beta,
         tiers=DEFAULT_TIERS,
         heartbeat_timeout=heartbeat_timeout,
+        allow_local=allow_local,
+        local_sglang_host=local_sglang_host,
+        local_sglang_port=local_sglang_port,
+        sglang_extra_argv=sglang_argv,
+        sglang_startup_timeout=sglang_startup_timeout,
     ))
 
 
