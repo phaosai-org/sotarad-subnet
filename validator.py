@@ -120,7 +120,7 @@ Image URL construction:
     Otherwise → IMAGE_BASE_URL + "/" + image_file.
     Set IMAGE_BASE_URL to the dataset server's image-serving endpoint.
 
-Reference baseline model: mervinpraison/Llama-3.2-11B-Vision-Radiology-mini
+Reference baseline model: 0llheaven/Llama-3.2-11B-Vision-Radiology-mini
 """
 
 from __future__ import annotations
