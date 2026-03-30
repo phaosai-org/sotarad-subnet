@@ -1,3 +1,5 @@
+## On-chain info
+
 Netuid: 28
 
 Wallets
@@ -18,3 +20,16 @@ Wallets
 │       
 └── Coldkey sotarad-vali2-testnet  ss58_address 5Hgsm3pLuEDs738vWc5T3zEgkocVpMkWd3CctJbfXxpGb3d1
     └── Hotkey default  ss58_address 5Cd7XVjAGp8o7vZ4PMNzckcnfNR84b9S7cNyCvAY85NdpVBk
+
+
+## Commands
+
+### Register miner model
+
+```
+cd /workspace/sotarad-subnet
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner1-testnet --hotkey default \
+  --repo 0llheaven/Llama-3.2-11B-Vision-Radiology-mini \
+  --revision b172c8c16b7a210f3b3fef77bc8d81f6f70fd9cc
+```

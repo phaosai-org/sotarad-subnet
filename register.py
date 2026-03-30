@@ -13,19 +13,19 @@ Commitment schema (JSON, ≤ 512 bytes)
     {
         "repo":     "hf-username/model-name",   # Hugging Face repo ID
         "revision": "abc1234...",               # git commit SHA (full or short)
-        "chute_id": "chutes-deployment-uuid",   # Chutes deployment ID from `af chutes_push`
-        "params":   2000000000                  # optional: parameter count for tie-breaking
+        "chute_id": "chutes-deployment-uuid",   # optional; empty if no Chutes deploy (HF + local SGLang)
     }
+
+Parameter counts for tier tie-breaks are **not** committed on-chain; validators
+resolve them from the Hugging Face model (``repo`` + ``revision``).
 
 Typical miner workflow (reference: docs/ARCHITECTURE.md §3)
 -----------------------------------------------------------
 1.  Train / improve a radiology model off-chain.
 2.  Upload to Hugging Face, record the git revision SHA.
-3.  Deploy to Chutes:  af chutes_push --repo <repo> --revision <SHA>
-4.  Register on-chain: python register.py commit \\
-                            --repo user/model \\
-                            --revision <SHA> \\
-                            --chute-id <chute_id>
+3.  (Optional) Deploy to Chutes and obtain ``chute_id``.
+4.  Register on-chain: python register.py commit --repo user/model --revision <SHA> [--chute-id <id>]
+    Omit or pass empty ``--chute-id`` when serving via HF + local inference only; validators must use ``--allow-local``.
 5.  Verify:            python register.py status
 
 Commands
@@ -46,6 +46,7 @@ from datetime import datetime, timezone
 
 import bittensor as bt
 import click
+from bittensor.core.chain_data.utils import decode_metadata
 from bittensor_wallet import Wallet
 
 
@@ -88,22 +89,18 @@ def _validate_revision(revision: str) -> str:
     return revision.lower()
 
 
-def _validate_chute_id(chute_id: str) -> str:
-    chute_id = chute_id.strip()
-    if not chute_id:
-        raise click.BadParameter("chute_id cannot be empty")
-    return chute_id
+def _normalize_chute_id(chute_id: str) -> str:
+    """Chutes deployment id, or empty string for HF-only (validator ``--allow-local``)."""
+    return chute_id.strip()
 
 
-def _build_payload(repo: str, revision: str, chute_id: str, params: int) -> str:
+def _build_payload(repo: str, revision: str, chute_id: str) -> str:
     """Serialize the commitment to a compact JSON string."""
     data: dict = {
         "repo":     repo,
         "revision": revision,
         "chute_id": chute_id,
     }
-    if params > 0:
-        data["params"] = params
     payload = json.dumps(data, separators=(",", ":"))
     if len(payload) > 512:
         raise click.UsageError(
@@ -130,34 +127,46 @@ def _get_commit_info(
     subtensor: bt.Subtensor,
     netuid: int,
     hotkey_ss58: str,
-    uid: int,
-    current_block: int,
 ) -> tuple[str | None, int]:
     """
     Returns (commitment_data_str, commit_block).
     commit_block is 0 if unavailable.
+
+    Uses a direct ``CommitmentOf`` query and decodes only when the value is a
+    dict. We avoid ``subtensor.get_commitment`` here: on an empty / missing
+    commitment, bittensor's ``get_commitment_metadata`` can return ``""``, and
+    ``decode_metadata`` then does ``metadata[\"info\"]`` and logs
+    ``TypeError: string indices must be integers, not 'str'``.
     """
-    data_str: str | None = None
-    commit_block: int = 0
-
-    try:
-        data_str = subtensor.get_commitment(netuid, uid)
-    except Exception as exc:
-        logger.debug(f"get_commitment failed: {exc}")
-
     try:
         result = subtensor.substrate.query(
             module="Commitments",
             storage_function="CommitmentOf",
             params=[netuid, hotkey_ss58],
+            block_hash=subtensor.determine_block_hash(None),
         )
-        if result is not None and result.value is not None:
-            val = result.value
-            if isinstance(val, dict):
-                commit_block = int(val.get("block", 0))
     except Exception as exc:
-        logger.debug(f"CommitmentOf query failed: {exc}")
+        logger.debug("CommitmentOf query failed: %s", exc)
+        return None, 0
 
+    if result is None:
+        return None, 0
+
+    # py-substrate-interface: sometimes a ScaleObj with .value, sometimes a raw dict.
+    if isinstance(result, dict):
+        val = result
+    else:
+        val = getattr(result, "value", None)
+    if val is None or not isinstance(val, dict):
+        return None, 0
+
+    commit_block = int(val.get("block", 0))
+    data_str: str | None = None
+    try:
+        data_str = decode_metadata(val)
+    except Exception as exc:
+        logger.debug("decode_metadata failed: %s", exc)
+        data_str = None
     return data_str, commit_block
 
 
@@ -208,10 +217,12 @@ def cli() -> None:
               help="Hugging Face repo ID, e.g. myuser/my-tb-model")
 @click.option("--revision",  required=True,
               help="Git commit SHA of the HF artifact (40-char hex)")
-@click.option("--chute-id",  required=True,
-              help="Chutes deployment ID returned by `af chutes_push`")
-@click.option("--params",    type=int, default=0, show_default=True,
-              help="Model parameter count (optional, used for tie-breaking)")
+@click.option(
+    "--chute-id",
+    default="",
+    show_default=False,
+    help="Chutes deployment ID from `af chutes_push` (optional; omit or '' for HF-only / local SGLang)",
+)
 @click.option("--dry-run",   is_flag=True, default=False,
               help="Validate and print the payload without writing to chain")
 @_chain_options
@@ -219,7 +230,6 @@ def commit(
     repo: str,
     revision: str,
     chute_id: str,
-    params: int,
     dry_run: bool,
     network: str,
     netuid: int,
@@ -229,8 +239,8 @@ def commit(
     """Submit a model commitment to the Bittensor chain."""
     repo     = _validate_repo(repo)
     revision = _validate_revision(revision)
-    chute_id = _validate_chute_id(chute_id)
-    payload  = _build_payload(repo, revision, chute_id, params)
+    chute_id = _normalize_chute_id(chute_id)
+    payload  = _build_payload(repo, revision, chute_id)
 
     click.echo("\n── Commitment payload ───────────────────────────────────────")
     click.echo(json.dumps(json.loads(payload), indent=2))
@@ -254,7 +264,7 @@ def commit(
     uid = _get_uid(subtensor, netuid, hotkey_ss58)
     if uid is not None:
         current_block = subtensor.get_current_block()
-        _, last_block = _get_commit_info(subtensor, netuid, hotkey_ss58, uid, current_block)
+        _, last_block = _get_commit_info(subtensor, netuid, hotkey_ss58)
         blocks_since  = (current_block - last_block) if last_block else _COMMIT_RATE_LIMIT_BLOCKS
         if 0 < blocks_since < _COMMIT_RATE_LIMIT_BLOCKS:
             remaining_s = int((_COMMIT_RATE_LIMIT_BLOCKS - blocks_since) * _BLOCK_TIME_S)
@@ -322,7 +332,7 @@ def status(
 
     # ── Commitment ────────────────────────────────────────────────────────────
     click.echo("\n── Commitment ───────────────────────────────────────────────")
-    data_str, commit_block = _get_commit_info(subtensor, netuid, hotkey_ss58, uid, current_block)
+    data_str, commit_block = _get_commit_info(subtensor, netuid, hotkey_ss58)
 
     if not data_str:
         click.secho(
@@ -340,12 +350,24 @@ def status(
 
     click.echo(f"  Repo     : {payload.get('repo',     '—')}")
     click.echo(f"  Revision : {payload.get('revision', '—')}")
-    click.echo(f"  Chute ID : {payload.get('chute_id', '—')}")
-    click.echo(f"  Params   : {payload.get('params',   '—')}")
+    _cid = str(payload.get("chute_id") or "").strip()
+    click.echo(
+        f"  Chute ID : {_cid or '— (empty; validators need --allow-local)'}"
+    )
+    if "params" in payload:
+        click.echo(
+            f"  Params   : {payload.get('params')} (legacy field; validators ignore — resolved from HF)"
+        )
+    else:
+        click.echo("  Params   : (not on-chain; validator resolves from Hugging Face)")
     click.echo(f"  Block    : {commit_block or 'unknown'}")
     click.echo(f"  Time     : {_block_to_human_ts(commit_block, current_block)}")
 
-    missing = [f for f in ("repo", "revision", "chute_id") if not payload.get(f)]
+    missing = [
+        f
+        for f in ("repo", "revision")
+        if not str(payload.get(f) or "").strip()
+    ]
     if missing:
         click.secho(f"\n  ✗ Commitment missing required fields: {missing}", fg="red")
         return
@@ -368,9 +390,13 @@ def status(
 @cli.command()
 @click.option("--repo",     required=True, help="Hugging Face repo ID")
 @click.option("--revision", required=True, help="Git commit SHA")
-@click.option("--chute-id", required=True, help="Chutes deployment ID")
-@click.option("--params",   type=int, default=0, help="Parameter count (optional)")
-def check(repo: str, revision: str, chute_id: str, params: int) -> None:
+@click.option(
+    "--chute-id",
+    default="",
+    show_default=False,
+    help="Chutes deployment ID (optional; empty for HF-only)",
+)
+def check(repo: str, revision: str, chute_id: str) -> None:
     """Validate commitment fields locally without touching the chain."""
     errors: list[str] = []
 
@@ -388,24 +414,17 @@ def check(repo: str, revision: str, chute_id: str, params: int) -> None:
         errors.append(str(exc))
         click.secho(f"  ✗ revision : {exc}", fg="red")
 
-    try:
-        chute_id = _validate_chute_id(chute_id)
+    chute_id = _normalize_chute_id(chute_id)
+    if chute_id:
         click.secho(f"  ✓ chute_id : {chute_id}", fg="green")
-    except click.BadParameter as exc:
-        errors.append(str(exc))
-        click.secho(f"  ✗ chute_id : {exc}", fg="red")
-
-    if params < 0:
-        errors.append("params must be >= 0")
-        click.secho("  ✗ params   : must be >= 0", fg="red")
-    elif params > 0:
-        click.secho(f"  ✓ params   : {params:,}", fg="green")
     else:
-        click.echo("  – params   : not provided (optional; used only for tie-breaking)")
+        click.echo("  – chute_id : (empty — HF-only; validators need --allow-local)")
+
+    click.echo("  – params   : not in commitment (validator resolves from Hugging Face)")
 
     if not errors:
         try:
-            payload = _build_payload(repo, revision, chute_id, params)
+            payload = _build_payload(repo, revision, chute_id)
             click.secho(f"\n✓ Commitment is valid ({len(payload)} bytes):", fg="green")
             click.echo(json.dumps(json.loads(payload), indent=2))
         except click.UsageError as exc:

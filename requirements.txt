@@ -1,4 +1,5 @@
 aiohttp==3.13.4
+huggingface_hub>=0.26.0
 bittensor==10.2.0
 bittensor-cli==9.20.0
 bittensor-wallet==4.0.1

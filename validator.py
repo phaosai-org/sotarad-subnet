@@ -11,7 +11,8 @@ submission time plus a configurable delay.
 Miner interface (Chutes / OpenAI-compatible vision endpoint)
 ----------------------------------------------------------
 Miners deploy a vision-language model to Chutes and commit JSON to chain
-(`repo`, `revision`, `chute_id`, optional `params`). Validators call:
+(``repo``, ``revision``, ``chute_id``). Parameter counts for tier tie-breaks are
+read from Hugging Face, not from the commitment. Validators call:
 
     POST {CHUTES_LLM_URL}/chat/completions
 
@@ -114,7 +115,6 @@ class MinerCommit:
     repo: str
     revision: str
     chute_id: str
-    params: int           # 0 if not provided by the miner
     commit_block: int
     commit_ts: float      # unix timestamp approximated from commit_block
 
@@ -263,6 +263,103 @@ def _block_to_timestamp(
     return time.time() - blocks_ago * block_time_s
 
 
+def _parameter_count_from_config_json(cfg: object) -> int:
+    """Best-effort total parameters from a ``config.json``-like dict."""
+    if not isinstance(cfg, dict):
+        return 0
+    for key in ("num_parameters", "num_params", "n_parameters", "total_parameters"):
+        v = cfg.get(key)
+        if isinstance(v, int) and v > 0:
+            return v
+    for child in (
+        "text_config",
+        "vision_config",
+        "audio_config",
+        "encoder_config",
+        "decoder_config",
+    ):
+        if child in cfg:
+            n = _parameter_count_from_config_json(cfg[child])
+            if n > 0:
+                return n
+    return 0
+
+
+def fetch_model_parameter_count_from_hf(repo: str, revision: str) -> int:
+    """
+    Resolve parameter count for ``repo`` @ ``revision`` from the Hugging Face Hub.
+
+    Uses safetensors metadata from the Hub API when available, otherwise scans
+    ``config.json``. Returns 0 if unknown (tier tie-break treats as very large).
+    """
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+    except ImportError:
+        logger.warning(
+            "huggingface_hub is not installed; cannot resolve parameter counts "
+            "(install huggingface_hub or tie-breaks assume unknown size)"
+        )
+        return 0
+
+    token = os.environ.get("HF_TOKEN")
+    api = HfApi(token=token) if token else HfApi()
+
+    try:
+        info = api.model_info(repo_id=repo, revision=revision)
+        st = getattr(info, "safetensors", None)
+        if st is not None:
+            total = int(getattr(st, "total", 0) or 0)
+            if total > 0:
+                return total
+            params_map = getattr(st, "parameters", None) or (
+                st.get("parameters", {}) if isinstance(st, dict) else {}
+            )
+            if isinstance(params_map, dict) and params_map:
+                s = sum(int(v) for v in params_map.values() if isinstance(v, int))
+                if s > 0:
+                    return s
+    except Exception as exc:
+        logger.debug("HfApi.model_info(%s @ %s): %s", repo, revision[:12], exc)
+
+    try:
+        path = hf_hub_download(
+            repo_id=repo,
+            filename="config.json",
+            revision=revision,
+            token=token,
+        )
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        n = _parameter_count_from_config_json(cfg)
+        if n > 0:
+            return n
+    except Exception as exc:
+        logger.debug("config.json for %s @ %s: %s", repo, revision[:12], exc)
+
+    return 0
+
+
+def resolve_uid_parameter_counts(commits: list[MinerCommit]) -> dict[int, int]:
+    """
+    Parameter counts from Hugging Face for tier tie-breaks only — never from chain.
+
+    Missing / unknown counts are omitted from the dict; ``compute_tier_weights`` treats
+    missing UID as unknown size (worst tie-break).
+    """
+    out: dict[int, int] = {}
+    for c in commits:
+        n = fetch_model_parameter_count_from_hf(c.repo, c.revision)
+        if n > 0:
+            out[c.uid] = n
+            logger.info("UID %s: parameter count %s (from Hugging Face)", c.uid, f"{n:,}")
+        else:
+            logger.info(
+                "UID %s: parameter count unknown (HF); tier tie-break uses unknown size",
+                c.uid,
+            )
+    return out
+
+
 def fetch_all_commits(
     subtensor: bt.Subtensor,
     metagraph: bt.Metagraph,
@@ -316,7 +413,6 @@ def fetch_all_commits(
             repo     = str(payload["repo"]).strip()
             revision = str(payload["revision"]).strip()
             chute_id = str(payload.get("chute_id") or "").strip()
-            params   = int(payload.get("params", 0))
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
             logger.debug(f"UID {uid}: invalid commitment JSON – {exc}")
             continue
@@ -343,7 +439,6 @@ def fetch_all_commits(
             repo=repo,
             revision=revision,
             chute_id=chute_id,
-            params=params,
             commit_block=commit_block,
             commit_ts=commit_ts,
         ))
@@ -773,10 +868,12 @@ async def run_daily_evaluation(
     local_sglang_port: int,
     sglang_extra_argv: list[str],
     sglang_startup_timeout: float,
-) -> list[MinerCommit]:
+) -> tuple[list[MinerCommit], dict[int, int]]:
     """
-    One complete daily evaluation pass.  Returns the list of eligible commits
-    so the caller can cache them for weight-setting between evaluations.
+    One complete daily evaluation pass.
+
+    Returns eligible commits and a UID → parameter-count map from Hugging Face
+    (for tier tie-breaks only; not from chain).
     """
     today = date.today().isoformat()
     logger.info(f"=== Daily evaluation starting for {today} ===")
@@ -800,7 +897,7 @@ async def run_daily_evaluation(
 
     if not eligible:
         logger.info("No eligible miners – skipping inference pass")
-        return eligible
+        return eligible, {}
 
     # 4. Fetch labelled evaluation samples from the public dataset API
     #    Window: last 24 h (today's window); each miner also filtered by its own cutoff below
@@ -820,7 +917,8 @@ async def run_daily_evaluation(
 
         if not samples:
             logger.warning("No evaluation samples returned – aborting evaluation pass")
-            return eligible
+            uid_params = await asyncio.to_thread(resolve_uid_parameter_counts, eligible)
+            return eligible, uid_params
 
         logger.info(f"Fetched {len(samples)} evaluation samples from dataset API")
 
@@ -887,7 +985,9 @@ async def run_daily_evaluation(
             saved += 1
 
     logger.info(f"=== Daily evaluation complete: {saved}/{len(eligible)} miners scored ===")
-    return eligible
+
+    uid_params = await asyncio.to_thread(resolve_uid_parameter_counts, eligible)
+    return eligible, uid_params
 
 
 # ── Tier engine ───────────────────────────────────────────────────────────────
@@ -911,6 +1011,7 @@ def compute_tier_weights(
     eligible_commits: list[MinerCommit],
     tiers: list[TierConfig],
     today: str,
+    uid_param_counts: dict[int, int],
 ) -> dict[int, float]:
     """
     Compute raw emission shares for each eligible UID across all tiers.
@@ -936,8 +1037,9 @@ def compute_tier_weights(
             mean_rec   = sum(s["recall_score"]    for s in scores) / n
             mean_prec  = sum(s["precision_score"] for s in scores) / n
             c          = uid_to_commit[uid]
-            params     = c.params if c.params > 0 else 10**12  # unknown → treated as very large
-            ranked.append((mean_fb, mean_rec, mean_prec, params, c.commit_block, uid))
+            nparams    = uid_param_counts.get(uid, 0)
+            params_tb  = nparams if nparams > 0 else 10**12  # unknown → treated as very large
+            ranked.append((mean_fb, mean_rec, mean_prec, params_tb, c.commit_block, uid))
 
         if not ranked:
             logger.debug(f"Tier {tier.name}: no UIDs with scores in [{since_date}, {until_date}]")
@@ -978,6 +1080,7 @@ async def set_weights_from_tiers(
     db_path: str,
     tiers: list[TierConfig],
     eligible_commits: list[MinerCommit],
+    uid_param_counts: dict[int, int],
 ) -> bool:
     """Derive weights from tier emissions and submit them on chain."""
     async def _burn_to_uid0(reason: str) -> bool:
@@ -993,7 +1096,12 @@ async def set_weights_from_tiers(
 
     today     = date.today().isoformat()
     emissions = await asyncio.to_thread(
-        compute_tier_weights, db_path, eligible_commits, tiers, today
+        compute_tier_weights,
+        db_path,
+        eligible_commits,
+        tiers,
+        today,
+        uid_param_counts,
     )
 
     # Only submit UIDs that actually earned emissions; zero-weight UIDs are
@@ -1105,6 +1213,7 @@ async def validator_loop(
         last_weight_block: int        = 0
         last_eval_date:    str        = ""
         eligible_commits:  list[MinerCommit] = []
+        uid_param_counts:  dict[int, int]    = {}
 
         # Pre-populate eligible_commits from chain so weight-setting works immediately
         current_block = await asyncio.to_thread(subtensor.get_current_block)
@@ -1117,6 +1226,9 @@ async def validator_loop(
             allow_local=allow_local,
         )
         eligible_commits = filter_eligible(deduplicate_commits(commits), eval_delay_days)
+        uid_param_counts = await asyncio.to_thread(
+            resolve_uid_parameter_counts, eligible_commits
+        )
 
         # ── Main loop ─────────────────────────────────────────────────────────
         while True:
@@ -1130,7 +1242,7 @@ async def validator_loop(
                 already_ran = await asyncio.to_thread(eval_already_ran_today, db_path, today)
                 if today != last_eval_date and not already_ran:
                     last_eval_date   = today  # set before to avoid tight-loop retries on failure
-                    eligible_commits = await run_daily_evaluation(
+                    eligible_commits, uid_param_counts = await run_daily_evaluation(
                         subtensor=subtensor,
                         metagraph=metagraph,
                         netuid=netuid,
@@ -1170,6 +1282,7 @@ async def validator_loop(
                         db_path=db_path,
                         tiers=tiers,
                         eligible_commits=eligible_commits,
+                        uid_param_counts=uid_param_counts,
                     )
                     if success:
                         last_weight_block = current_block
