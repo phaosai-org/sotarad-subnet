@@ -93,18 +93,20 @@ EVAL_TARGET_CONDITIONS: frozenset[str] = frozenset(
 class TierConfig:
     """Defines one emission tier."""
     name: str
-    lookback_days: int
+    lookback_periods: int  # number of eval periods to look back
     top_n: Optional[int]       # e.g. 1 for "top-1 miner"; mutually exclusive with top_pct
     top_pct: Optional[float]   # e.g. 0.10 for "top 10 %"; mutually exclusive with top_n
     emission_share: float      # fraction of total weight budget, e.g. 0.95
 
 
 DEFAULT_TIERS: list[TierConfig] = [
-    TierConfig("A", lookback_days=5, top_n=1,    top_pct=None, emission_share=0.95),
-    TierConfig("B", lookback_days=4, top_n=None, top_pct=0.10, emission_share=0.02),
-    TierConfig("C", lookback_days=3, top_n=None, top_pct=0.20, emission_share=0.015),
-    TierConfig("D", lookback_days=2, top_n=None, top_pct=0.30, emission_share=0.010),
-    TierConfig("E", lookback_days=1, top_n=None, top_pct=0.40, emission_share=0.005),
+    # lookback_periods are expressed directly in units of the evaluation period.
+    # For example, with eval_period_minutes=10, lookback_periods=5 means 5*10=50 minutes.
+    TierConfig("A", lookback_periods=5,  top_n=1,    top_pct=None, emission_share=0.95),
+    TierConfig("B", lookback_periods=4,  top_n=None, top_pct=0.10, emission_share=0.02),
+    TierConfig("C", lookback_periods=3,  top_n=None, top_pct=0.20, emission_share=0.015),
+    TierConfig("D", lookback_periods=2,  top_n=None, top_pct=0.30, emission_share=0.010),
+    TierConfig("E", lookback_periods=1,  top_n=None, top_pct=0.40, emission_share=0.005),
 ]
 
 
@@ -1058,14 +1060,14 @@ async def run_daily_evaluation(
 
 def _lookback_period_keys(
     current_period_id: int,
-    lookback_days: int,
+    lookback_periods: int,
     eval_period_minutes: int,
 ) -> tuple[str, str]:
     """
-    Map nominal tier ``lookback_days`` to a contiguous range of eval period keys
-    ending at ``current_period_id``. Uses ``ceil(days * 24h / period_len)`` periods.
+    Map tier ``lookback_periods`` (in units of eval periods) to a contiguous
+    range of eval period keys ending at ``current_period_id``.
     """
-    n_periods = max(1, math.ceil(lookback_days * 24 * 60 / eval_period_minutes))
+    n_periods = max(1, int(lookback_periods))
     since_pid = current_period_id - (n_periods - 1)
     return format_eval_period_key(since_pid), format_eval_period_key(current_period_id)
 
@@ -1089,7 +1091,7 @@ def compute_tier_weights(
 
     for tier in tiers:
         since_key, until_key = _lookback_period_keys(
-            current_period_id, tier.lookback_days, eval_period_minutes
+            current_period_id, tier.lookback_periods, eval_period_minutes
         )
 
         # Build aggregate Fβ (mean) over the lookback window for each UID
@@ -1152,7 +1154,7 @@ def log_recent_fb_scores_for_uids(
     eligible_commits: list[MinerCommit],
     current_period_id: int,
     eval_period_minutes: int,
-    max_lookback_days: int,
+    max_lookback_periods: int,
 ) -> None:
     """
     Log a compact table of recent Fβ scores for each eligible UID.
@@ -1165,7 +1167,7 @@ def log_recent_fb_scores_for_uids(
         return
 
     # Determine the last 5 periods (bounded by the longest lookback window).
-    window_periods = max(1, math.ceil(max_lookback_days * 24 * 60 / eval_period_minutes))
+    window_periods = max(1, int(max_lookback_periods))
     last_n = 5
     n_periods = min(window_periods, last_n)
     first_pid = current_period_id - (n_periods - 1)
@@ -1173,8 +1175,8 @@ def log_recent_fb_scores_for_uids(
     period_keys = [format_eval_period_key(pid) for pid in period_ids]
 
     logger.info(
-        "Recent Fβ table for tier lookback (days=%d): last %d period(s) [%s .. %s]",
-        max_lookback_days,
+        "Recent Fβ table for tier lookback (periods=%d): last %d period(s) [%s .. %s]",
+        max_lookback_periods,
         n_periods,
         period_keys[0],
         period_keys[-1],
@@ -1253,14 +1255,14 @@ async def set_weights_from_tiers(
     # Log recent Fβ scores for each eligible UID over the longest tier lookback
     # window so operators can see which periods feed into tier computation.
     if tiers:
-        max_lookback_days = max(t.lookback_days for t in tiers)
+        max_lookback_periods = max(t.lookback_periods for t in tiers)
         await asyncio.to_thread(
             log_recent_fb_scores_for_uids,
             db_path,
             eligible_commits,
             current_period_id,
             eval_period_minutes,
-            max_lookback_days,
+            max_lookback_periods,
         )
 
     # Only submit UIDs that actually earned emissions; zero-weight UIDs are

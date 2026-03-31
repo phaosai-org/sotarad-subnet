@@ -23,14 +23,15 @@ use an absolute ``repo`` in the commitment.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import signal
 import sys
 import time
+import socket
 from subprocess import DEVNULL, Popen
 from typing import Optional
+import asyncio
 
 import aiohttp
 
@@ -83,9 +84,39 @@ class SglangSubprocessServer:
         path = os.path.abspath(os.path.expanduser(self.hf_repo))
         return os.path.isdir(path)
 
+    def _wait_for_port_free(self, timeout_s: float = 60.0) -> bool:
+        """
+        Block until (host, port) is not accepting TCP connections, or timeout.
+
+        This is a defensive guard to avoid "address already in use" / GPU OOM
+        when a previous server on the same port hasn't fully torn down yet.
+        """
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() < deadline:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.0)
+                try:
+                    # If connect_ex returns 0, something is still listening.
+                    if s.connect_ex((self.host, self.port)) != 0:
+                        return True
+                except OSError:
+                    # Treat connection errors as "port free".
+                    return True
+            time.sleep(1.0)
+        logger.warning(
+            "Port %s:%d still appears to be in use after %.0fs",
+            self.host,
+            self.port,
+            timeout_s,
+        )
+        return False
+
     def start(self) -> None:
         if self._proc is not None:
             raise RuntimeError("SGLang server already started")
+        # Best-effort wait for any previous server on this port to fully exit
+        # (including cases where the last process crashed and is still cleaning up).
+        self._wait_for_port_free(timeout_s=60.0)
         cmd = [
             sys.executable,
             "-m",
@@ -160,4 +191,7 @@ class SglangSubprocessServer:
                 proc.kill()
             except ProcessLookupError:
                 pass
+        # After the process is gone, wait briefly for the OS / drivers to
+        # release the listening socket and GPU memory before reusing the port.
+        self._wait_for_port_free(timeout_s=30.0)
         logger.info("SGLang subprocess stopped")
