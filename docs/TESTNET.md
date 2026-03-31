@@ -47,6 +47,55 @@ python3 register.py commit --network test --netuid 28 \
   --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 ```
 
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner4-testnet --hotkey default \
+  --repo Qwen/Qwen3.5-9B \
+  --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a
+```
+
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner5-testnet --hotkey default \
+  --repo allenai/MolmoWeb-8B \
+  --revision 236051ba97fdcc997028ee2acf6fa6a89d98b74d
+```
+
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner6-testnet --hotkey default \
+  --repo allenai/MolmoWeb-8B \
+  --revision 236051ba97fdcc997028ee2acf6fa6a89d98b74d
+```
+
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner7-testnet --hotkey default \
+  --repo allenai/MolmoWeb-4B \
+  --revision 0761af09cac93f5c2b10f839141150023f89b1d2
+```
+
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner8-testnet --hotkey default \
+  --repo Qwen/Qwen3.5-4B \
+  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+```
+
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner9-testnet --hotkey default \
+  --repo Qwen/Qwen3.5-4B \
+  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+```
+
+```
+python3 register.py commit --network test --netuid 28 \
+  --coldkey sotarad-miner10-testnet --hotkey default \
+  --repo Qwen/Qwen3.5-4B \
+  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+```
+
 ### Status of commit
 
 ```
@@ -60,6 +109,17 @@ python3 mock/dataset_api.py --port 8100 --data-dir ./data
 ```
 
 ### Run validator
+
+```
+python3 validator.py \
+  --network test \
+  --netuid 28 \
+  --coldkey sotarad-owner-testnet \
+  --hotkey default \
+  --eval-period-minutes 10 \
+  --allow-local \
+  --mock
+```
 
 ```
 python3 validator.py \

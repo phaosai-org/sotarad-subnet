@@ -1024,6 +1024,32 @@ async def run_daily_evaluation(
 
     logger.info("=== Evaluation pass complete: %s/%s miners scored ===", saved, len(eligible))
 
+    # Log a compact summary of this eval period for all scored miners so operators
+    # can see per-UID metrics in one block.
+    period_summary = [
+        r
+        for r in results
+        if r is not None
+    ]
+    if period_summary:
+        logger.info(
+            "Evaluation period %s summary (per UID: Fβ, P, R, TP, FP, FN, TN, n):",
+            eval_period_key,
+        )
+        for r in sorted(period_summary, key=lambda x: x.uid):
+            logger.info(
+                "  UID %d | Fβ=%.4f P=%.4f R=%.4f | TP=%d FP=%d FN=%d TN=%d n=%d",
+                r.uid,
+                r.fb_score,
+                r.precision_score,
+                r.recall_score,
+                r.tp,
+                r.fp,
+                r.fn,
+                r.tn,
+                r.sample_count,
+            )
+
     uid_params = await asyncio.to_thread(resolve_uid_parameter_counts, eligible)
     return eligible, uid_params
 
@@ -1121,6 +1147,72 @@ def compute_tier_weights(
     return emissions
 
 
+def log_recent_fb_scores_for_uids(
+    db_path: str,
+    eligible_commits: list[MinerCommit],
+    current_period_id: int,
+    eval_period_minutes: int,
+    max_lookback_days: int,
+) -> None:
+    """
+    Log a compact table of recent Fβ scores for each eligible UID.
+
+    Columns: last 5 eval period keys (most recent on the right).
+    Rows:    UID.
+    Cells:   Fβ for that UID+period (blank if no score).
+    """
+    if not eligible_commits:
+        return
+
+    # Determine the last 5 periods (bounded by the longest lookback window).
+    window_periods = max(1, math.ceil(max_lookback_days * 24 * 60 / eval_period_minutes))
+    last_n = 5
+    n_periods = min(window_periods, last_n)
+    first_pid = current_period_id - (n_periods - 1)
+    period_ids = list(range(first_pid, current_period_id + 1))
+    period_keys = [format_eval_period_key(pid) for pid in period_ids]
+
+    logger.info(
+        "Recent Fβ table for tier lookback (days=%d): last %d period(s) [%s .. %s]",
+        max_lookback_days,
+        n_periods,
+        period_keys[0],
+        period_keys[-1],
+    )
+
+    # Header row (UID column width=3, period columns width=10).
+    # Display period keys without leading zeros, but keep full keys for lookups.
+    display_keys = [k.lstrip("0") or "0" for k in period_keys]
+    header = f"{'UID':>3} " + " ".join(f"{k:>10}" for k in display_keys)
+    logger.info(header)
+
+    any_scores = False
+    for c in sorted(eligible_commits, key=lambda x: x.uid):
+        uid = c.uid
+        # Fetch all scores in the window [first_pid, current_period_id]
+        since_key = period_keys[0]
+        until_key = period_keys[-1]
+        scores = query_scores_for_uid(db_path, uid, since_key, until_key)
+        by_date = {row["eval_date"]: row for row in scores}
+        cells: list[str] = []
+        for k in period_keys:
+            row = by_date.get(k)
+            if row is None:
+                cells.append(" " * 10)
+            else:
+                any_scores = True
+                cells.append(f"{row['fb_score']:>10.4f}")
+        line = f"{uid:>3} " + " ".join(cells)
+        logger.info(line)
+
+    if not any_scores:
+        logger.info(
+            "No historical Fβ scores found in periods [%s, %s] for eligible UIDs",
+            period_keys[0],
+            period_keys[-1],
+        )
+
+
 # ── Weight setting ────────────────────────────────────────────────────────────
 
 async def set_weights_from_tiers(
@@ -1157,6 +1249,19 @@ async def set_weights_from_tiers(
         eval_period_minutes,
         uid_param_counts,
     )
+
+    # Log recent Fβ scores for each eligible UID over the longest tier lookback
+    # window so operators can see which periods feed into tier computation.
+    if tiers:
+        max_lookback_days = max(t.lookback_days for t in tiers)
+        await asyncio.to_thread(
+            log_recent_fb_scores_for_uids,
+            db_path,
+            eligible_commits,
+            current_period_id,
+            eval_period_minutes,
+            max_lookback_days,
+        )
 
     # Only submit UIDs that actually earned emissions; zero-weight UIDs are
     # excluded from the set_weights call to keep the payload clean.
