@@ -1,4 +1,4 @@
-# Radiology Pre-Screening Subnet (TB First)
+# Radiology Pre-Screening Subnet
 
 ## Bittensor Subnet Ideathon Proposal
 
