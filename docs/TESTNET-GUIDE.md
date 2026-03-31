@@ -18,13 +18,62 @@ Wallets
 ├── Coldkey sotarad-vali1-testnet  ss58_address 5EPeihFiqjtgqeSWxKL5NsA7tdkVZJNYK4C5Ho9HTd6h2KbH
 │   └── Hotkey default  ss58_address 5Evq8YR8MX4Y6cmkumXaSwd2vMfVYDmHUMHGNPEg6fQRmMqD
 │       
-└── Coldkey sotarad-vali2-testnet  ss58_address 5Hgsm3pLuEDs738vWc5T3zEgkocVpMkWd3CctJbfXxpGb3d1
-    └── Hotkey default  ss58_address 5Cd7XVjAGp8o7vZ4PMNzckcnfNR84b9S7cNyCvAY85NdpVBk
+├── Coldkey sotarad-vali2-testnet  ss58_address 5Hgsm3pLuEDs738vWc5T3zEgkocVpMkWd3CctJbfXxpGb3d1
+│   └── Hotkey default  ss58_address 5Cd7XVjAGp8o7vZ4PMNzckcnfNR84b9S7cNyCvAY85NdpVBk
+│       
+├── Coldkey sotarad-miner4-testnet  ss58_address 5CtCuB8L8J5esQvNDSwuDdYqbYUvtNZ44Tn7n7DtrvnMtN7K
+│   └── Hotkey default  ss58_address 5DRQvDjv1roQ77YjL6S8rShCspZPxKnby2WEPRRRwchrRuJi
+│       
+├── Coldkey sotarad-miner5-testnet  ss58_address 5DniWr2zzJyHeCk7b8k5JprLaKG8zapHg88NamubQGacDzbD
+│   └── Hotkey default  ss58_address 5F4xcPSKsawmNaoC8QvjMX3dq1GERFNErpp2Udm1Z7eNtdNh
+│       
+├── Coldkey sotarad-miner6-testnet  ss58_address 5HGZMGRVvX2FoqNw1yMcnBfVwHdGCEzZ4yj5Ko98bgt72Saz
+│   └── Hotkey default  ss58_address 5E2UTqhL48FZoLC7kQKGvE4ovHXgLTiddv6DHckvAQLhEXXF
+│       
+├── Coldkey sotarad-miner7-testnet  ss58_address 5H8RvxX2FV3BmgMiEGG7DoR29FCnFMq2RzqC16E95dGmtAQY
+│   └── Hotkey default  ss58_address 5GZbJKfLKeuSNpqWQreidhVPMDXipbmsCDCe65VU84pdvW4i
+│       
+├── Coldkey sotarad-miner8-testnet  ss58_address 5EFLYaEe8VKuKYP7cfcwuLihYN8jkAZUDHbyELQv1ECEqrfN
+│   └── Hotkey default  ss58_address 5ELVHEQ3twWsngcnGqu6X4eMpa9qnDvbDNK13TJYU49Mitim
+│       
+├── Coldkey sotarad-miner9-testnet  ss58_address 5F1mjxxVqn2qhkAw1W3SzwFusZgosw6wdwviu4GgMbKohrpC
+│   └── Hotkey default  ss58_address 5ES3pwzWAh8zSu4xPEfo3RUDqSoqQWMgjjBabjmUs9TqycPA
+│       
+└── Coldkey sotarad-miner10-testnet  ss58_address 5HB2sm9B3ZJ2XNv8WhrpzBfuQiimxfoXkdk5jFKfKNQt4ccH
+    └── Hotkey default  ss58_address 5DEthjjznK87qdBcysGaDP5qENAmRs15W1WAxJ79zwys3YQw
 
 
-## Commands
+## How to reproduce testnet results
 
-### Register miner model
+### Setup Repo
+
+```
+git clone https://github.com/phaosai-org/sotarad-subnet
+```
+
+```
+cd sotarad-subnet
+```
+
+```
+python3 -m venv .venv
+```
+
+```
+source .venv/bin/activate
+```
+
+```
+pip3 install -r requirements.txt
+```
+
+### Register a neuron
+
+```
+btcli s register --subtensor.network test --netuid 28 --name sotarad-miner1-testnet
+```
+
+### Register a model (MINER)
 
 ```
 python3 register.py commit --network test --netuid 28 \
@@ -68,47 +117,25 @@ python3 register.py commit --network test --netuid 28 \
   --revision 236051ba97fdcc997028ee2acf6fa6a89d98b74d
 ```
 
-```
-python3 register.py commit --network test --netuid 28 \
-  --coldkey sotarad-miner7-testnet --hotkey default \
-  --repo allenai/MolmoWeb-4B \
-  --revision 0761af09cac93f5c2b10f839141150023f89b1d2
-```
-
-```
-python3 register.py commit --network test --netuid 28 \
-  --coldkey sotarad-miner8-testnet --hotkey default \
-  --repo Qwen/Qwen3.5-4B \
-  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
-```
-
-```
-python3 register.py commit --network test --netuid 28 \
-  --coldkey sotarad-miner9-testnet --hotkey default \
-  --repo Qwen/Qwen3.5-4B \
-  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
-```
-
-```
-python3 register.py commit --network test --netuid 28 \
-  --coldkey sotarad-miner10-testnet --hotkey default \
-  --repo Qwen/Qwen3.5-4B \
-  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
-```
-
-### Status of commit
+### Check status of commit (MINER)
 
 ```
 python register.py status --network test --netuid 28 --coldkey sotarad-miner1-testnet --hotkey default
 ```
 
-### Mock Data API
+### Mock Data API (VALIDATOR)
 
 ```
 python3 mock/dataset_api.py --port 8100 --data-dir ./data
 ```
 
-### Run validator
+### Run validator process (VALIDATOR)
+
+In order to run a validator process, we recommend you use A6000 GPU server.
+
+```
+pip3 install sglang
+```
 
 ```
 python3 validator.py \
@@ -126,6 +153,17 @@ python3 validator.py \
   --network test \
   --netuid 28 \
   --coldkey sotarad-vali1-testnet \
+  --hotkey default \
+  --eval-period-minutes 10 \
+  --allow-local \
+  --mock
+```
+
+```
+python3 validator.py \
+  --network test \
+  --netuid 28 \
+  --coldkey sotarad-vali2-testnet \
   --hotkey default \
   --eval-period-minutes 10 \
   --allow-local \
